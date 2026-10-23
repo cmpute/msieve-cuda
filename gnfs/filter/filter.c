@@ -139,6 +139,11 @@ static void dump_relation_numbers(msieve_obj *obj, filter_t *filter) {
 }
 
 /*--------------------------------------------------------------------*/
+/* local patch: honour filter_lpbound= in EVERY call to set_filtering_bounds,
+   not only the first one. the derived/clamped bound is recomputed for the second
+   LP pass, which otherwise re-expands the ideal set and collapses the dataset. */
+static uint32 g_filter_lpbound_user = 0;
+
 static void set_filtering_bounds(msieve_obj *obj, factor_base_t *fb,
 			uint32 filtmin_r, uint32 filtmin_a,
 			uint32 *entries_r_out, uint32 *entries_a_out,
@@ -159,6 +164,9 @@ static void set_filtering_bounds(msieve_obj *obj, factor_base_t *fb,
 			filtmin_a = MIN(filtmin_a / 2, 720000);
 		}
 	}
+
+	if (g_filter_lpbound_user > 0)
+		filtmin_r = filtmin_a = g_filter_lpbound_user;
 
 	logprintf(obj, "reading ideals above %u\n", filtmin_r);
 	find_fb_size(fb, filtmin_r, filtmin_a, &entries_r, &entries_a);
@@ -345,6 +353,7 @@ uint32 nfs_filter_relations(msieve_obj *obj, mpz_t n) {
 		tmp = strstr(obj->nfs_args, "filter_lpbound=");
 		if (tmp != NULL) {
 			filter_bound = strtoul(tmp + 15, NULL, 10);
+			g_filter_lpbound_user = filter_bound;
 			logprintf(obj, "setting large prime bound to %u\n",
 					filter_bound);
 		}
