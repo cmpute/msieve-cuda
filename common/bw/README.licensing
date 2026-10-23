@@ -1,0 +1,82 @@
+Licensing map for common/bw/
+============================
+
+msieve proper is public domain. The Block Wiedemann implementation under
+common/bw/ mixes public-domain new code with vendored LGPL-2.1+ files.
+Every vendored file keeps its original copyright and license header
+untouched. This file maps origin and license for everything vendored,
+per the day-1 provenance rules in BW.md.
+
+Provenance pins (snapshot taken 2026-10-24 via `git archive`, so the
+dirty state of the live trees never leaks in):
+
+  cado-nfs-cognition   commit b5ca9c4 ("cado-nfs: latest version")
+                       /media/nas/users/jacob/factor/cado-nfs-cognition
+  msieve_nfsathome     commit 0f25603 + local filter_lpbound patch
+                       (re-applied and committed on the block-wiedemann
+                       branch)
+  cuda-mpqs            v1.0.8 (Heinrichs & Januszewski), DESIGN REFERENCE
+                       ONLY - zero files copied (LGPL-3.0-only). The
+                       patterns credited to it are listed in BW.md
+                       ("Adopted patterns").
+
+Directory map
+-------------
+
+  bw.h, bw.c, bw_matrix.*, bw_gpu.*, bw_krylov.c, bw_mksol.c,
+  bw_checkpoint.*, bw_seq.h, bw_lingen.h, bw_lingen.cpp (shim glue),
+  bw_kernel.cu, bw_selftest.c
+        New code written for this project. Public domain, same terms
+        as the rest of msieve.
+
+  cado/bwc/            lingen generator, vendored from
+                       cado-nfs-cognition b5ca9c4 linalg/bwc/lingen_*,
+                       tree_stats.hpp. LGPL-2.1+ (cado-nfs license).
+                       Edits are local and marked with `/* bw-local */`
+                       comments where they occur.
+
+  cado/bblas/          GF(2) block matrix kernels (mat64/mat8/bpack and
+                       the level sources the lingen base case calls),
+                       vendored from b5ca9c4 linalg/bblas/. LGPL-2.1+.
+
+  cado/                submatrix_range.hpp (b5ca9c4 linalg/), macros.h
+                       (b5ca9c4 root, generated header archived as-is).
+                       LGPL-2.1+.
+
+  cado/utils/          gmp_aux, cxx_mpz, gmp_auxx, utils_cxx, params,
+                       timing, misc, omp_proxy, runtime_numeric_cast
+                       from b5ca9c4 utils/. LGPL-2.1+.
+                       cado/utils/embedded/ is the {fmt} core
+                       (MIT licensed, upstream fmtlib/fmt) as bundled
+                       by cado; see cado/utils/embedded/LICENSE if
+                       present, else
+                       https://github.com/fmtlib/fmt/blob/master/LICENSE.
+
+  cado/shims/          NEW files, public domain: cado_config.h,
+                       cado.h, select_mpi.h and the other compile-time
+                       stand-ins that replace cado's build system.
+
+  gf2x/                The gf2x library vendored from b5ca9c4 gf2x/
+                       (upstream https://gforge.inria.fr/projects/gf2x/
+                       -> https://gitlab.inria.fr/gf2x/gf2x, a mirror
+                       of the copy shipped inside cado-nfs).
+                       LGPL-2.1+ by default: we build with
+                       toom-gpl-placeholder.c instead of toom-gpl.c, so
+                       the resulting libgf2x.a avoids the GPL-3.0-only
+                       Toom code. Setting BW_GPL_GF2X=1 at build time
+                       swaps the real (faster) GPL Toom code in.
+
+Static-linking note (LGPL v2.1 section 6): libmsieve.a with BW=1 is a
+static combination. We satisfy the relinking requirement by shipping
+the object files and the vendored sources alongside the binary (this
+tree), so a user can relink a modified LGPL component. For binary-only
+distribution build with BW=1 and prefer producing libmsieve_bw.so and
+dynamically linking the CADO/gf2x portions; the Makefile keeps both
+options open.
+
+cuda-mpqs (LGPL-3.0-only) was studied for design patterns only; no
+code, no verbatim comments, no copied identifiers. Patterns credited
+to it in BW.md: circular-history backtracking in mksol, golden-hash
+verification cascade, EOF completeness sentinel, strict option
+validation/occupancy preflights. All code here implementing those
+ideas was written from scratch.
