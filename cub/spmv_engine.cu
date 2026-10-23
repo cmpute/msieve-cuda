@@ -276,7 +276,16 @@ __global__ void csr_spmv_xor_scatter_kernel(const uint32_t* __restrict__ rowptr,
 // ------------------------------- Host side ------------------------------- //
 
 // Engine state tuned on first run
-struct SpmvEngine { int threads_per_block; int warp_items; bool tuned; int kernel_mode; };
+struct SpmvEngine {
+    int threads_per_block;
+    int warp_items;
+    bool tuned;
+    int kernel_mode;
+    /* bw-local: cache-preference done bit, per engine (= per device in the
+       BW multi-GPU path). Used to be a process-global static, which meant
+       cudaFuncSetCacheConfig only ever ran on the first device used. */
+    bool cache_configured[3];
+};
 
 enum { K_WARPMERGE, K_SEGSCAN, K_SCATTER };
 
@@ -371,6 +380,7 @@ SPMV_API void* spmv_engine_init(int* vbits) {
     e->warp_items = 512;        // default
     e->tuned = false;
     e->kernel_mode = SPMV_KERNEL_AUTO;
+    e->cache_configured[0] = e->cache_configured[1] = e->cache_configured[2] = false;
     return (void*)e;
 }
 
@@ -384,31 +394,31 @@ SPMV_API void spmv_engine_set_kernel(void* e, int kernel) {
 SPMV_API void spmv_engine_free(void* e) { delete reinterpret_cast<SpmvEngine*>(e); }
 
 template<int TWarpItems>
-static void spmv_launch(int kernel, int blocks, int tpb, const uint32_t* rowptr,
+static void spmv_launch(SpmvEngine* eng, int kernel, int blocks, int tpb, const uint32_t* rowptr,
                         const uint32_t* colidx, const v_t* x, v_t* y,
-                        int num_rows, uint32_t total_nnz) {
-    // the cache preference never changes, so set it once per kernel
-    static bool configured[3] = { false, false, false };
-    if (!configured[kernel]) {
+                        int num_rows, uint32_t total_nnz, cudaStream_t stream) {
+    // the cache preference never changes, so set it once per kernel (and,
+    // with the flag now per-engine, once per device in multi-GPU builds)
+    if (!eng->cache_configured[kernel]) {
         if (kernel == K_SCATTER)
             cudaFuncSetCacheConfig(csr_spmv_xor_scatter_kernel<TWarpItems>, cudaFuncCachePreferL1);
         else if (kernel == K_SEGSCAN)
             cudaFuncSetCacheConfig(csr_spmv_xor_segscan_kernel<TWarpItems>, cudaFuncCachePreferL1);
         else
             cudaFuncSetCacheConfig(csr_spmv_xor_warpmerge_kernel<TWarpItems>, cudaFuncCachePreferL1);
-        configured[kernel] = true;
+        eng->cache_configured[kernel] = true;
     }
 
     if (kernel == K_SCATTER) {
-        csr_spmv_xor_scatter_kernel<TWarpItems><<<blocks, tpb>>>(rowptr, colidx, x, y, num_rows, total_nnz);
+        csr_spmv_xor_scatter_kernel<TWarpItems><<<blocks, tpb, 0, stream>>>(rowptr, colidx, x, y, num_rows, total_nnz);
     } else if (kernel == K_SEGSCAN) {
-        csr_spmv_xor_segscan_kernel<TWarpItems><<<blocks, tpb>>>(rowptr, colidx, x, y, num_rows, total_nnz);
+        csr_spmv_xor_segscan_kernel<TWarpItems><<<blocks, tpb, 0, stream>>>(rowptr, colidx, x, y, num_rows, total_nnz);
     } else {
-        csr_spmv_xor_warpmerge_kernel<TWarpItems><<<blocks, tpb>>>(rowptr, colidx, x, y, num_rows, total_nnz);
+        csr_spmv_xor_warpmerge_kernel<TWarpItems><<<blocks, tpb, 0, stream>>>(rowptr, colidx, x, y, num_rows, total_nnz);
     }
 }
 
-static void spmv_run_common(void* e, spmv_data_t* spmv_data, bool trans) {
+static void spmv_run_common(void* e, spmv_data_t* spmv_data, bool trans, cudaStream_t stream) {
     SpmvEngine* eng = reinterpret_cast<SpmvEngine*>(e);
 
     const uint32_t* rowptr = reinterpret_cast<const uint32_t*>(spmv_data->row_entries);
@@ -442,23 +452,23 @@ static void spmv_run_common(void* e, spmv_data_t* spmv_data, bool trans) {
         switch (eng->warp_items) {
             case 256:
                 SPMV_NVTX_PUSH(trans ? "spmv_run_trans[wi=256]" : "spmv_run[wi=256]");
-                spmv_launch<256>(kernel, blocks, tpb, rowptr, colidx, x, y, num_rows, total_nnz);
+                spmv_launch<256>(eng, kernel, blocks, tpb, rowptr, colidx, x, y, num_rows, total_nnz, stream);
                 SPMV_NVTX_POP();
                 break;
             case 1024:
                 SPMV_NVTX_PUSH(trans ? "spmv_run_trans[wi=1024]" : "spmv_run[wi=1024]");
-                spmv_launch<1024>(kernel, blocks, tpb, rowptr, colidx, x, y, num_rows, total_nnz);
+                spmv_launch<1024>(eng, kernel, blocks, tpb, rowptr, colidx, x, y, num_rows, total_nnz, stream);
                 SPMV_NVTX_POP();
                 break;
             case 2048:
                 SPMV_NVTX_PUSH(trans ? "spmv_run_trans[wi=2048]" : "spmv_run[wi=2048]");
-                spmv_launch<2048>(kernel, blocks, tpb, rowptr, colidx, x, y, num_rows, total_nnz);
+                spmv_launch<2048>(eng, kernel, blocks, tpb, rowptr, colidx, x, y, num_rows, total_nnz, stream);
                 SPMV_NVTX_POP();
                 break;
             case 512:
             default:
                 SPMV_NVTX_PUSH(trans ? "spmv_run_trans[wi=512]" : "spmv_run[wi=512]");
-                spmv_launch<512>(kernel, blocks, tpb, rowptr, colidx, x, y, num_rows, total_nnz);
+                spmv_launch<512>(eng, kernel, blocks, tpb, rowptr, colidx, x, y, num_rows, total_nnz, stream);
                 SPMV_NVTX_POP();
                 break;
         }
@@ -472,11 +482,23 @@ static void spmv_run_common(void* e, spmv_data_t* spmv_data, bool trans) {
 }
 
 SPMV_API void spmv_engine_run(void* e, spmv_data_t* spmv_data) {
-    spmv_run_common(e, spmv_data, false);
+    spmv_run_common(e, spmv_data, false, (cudaStream_t)0);
 }
 
 // y ^= A^T * x where spmv_data describes a CSR block of A (not A^T):
 // vector_in is indexed by row, vector_out by column.
 SPMV_API void spmv_engine_run_trans(void* e, spmv_data_t* spmv_data) {
-    spmv_run_common(e, spmv_data, true);
+    spmv_run_common(e, spmv_data, true, (cudaStream_t)0);
+}
+
+// bw-local: stream-aware variants for the Block Wiedemann worker threads.
+// The caller owns the device context (cudaSetDevice) and the stream; the
+// legacy entries above stay on stream 0 so the Block Lanczos path is
+// unchanged. CUstream and cudaStream_t are the same object type.
+SPMV_API void spmv_engine_run_on(void* e, spmv_data_t* spmv_data, CUstream stream) {
+    spmv_run_common(e, spmv_data, false, (cudaStream_t)stream);
+}
+
+SPMV_API void spmv_engine_run_trans_on(void* e, spmv_data_t* spmv_data, CUstream stream) {
+    spmv_run_common(e, spmv_data, true, (cudaStream_t)stream);
 }

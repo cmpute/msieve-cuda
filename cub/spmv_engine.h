@@ -36,6 +36,16 @@ enum {
 };
 typedef void (*spmv_engine_set_kernel_func)(void * e, int kernel);
 
+/* bw-local: stream-aware entries. The caller owns the device context
+   (cudaSetDevice) and the stream; CUstream and cudaStream_t are the
+   same object type. Existing entries keep stream-0 behaviour. */
+typedef void (*spmv_engine_run_on_func)(void * e,
+				spmv_data_t * spmv_data,
+				CUstream stream);
+typedef void (*spmv_engine_run_trans_on_func)(void * e,
+				spmv_data_t * spmv_data,
+				CUstream stream);
+
 #ifdef __cplusplus
 }
 #endif
