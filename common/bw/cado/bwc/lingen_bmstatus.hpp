@@ -27,7 +27,7 @@ struct bmstatus {
     double t_mul = 0;
     double t_cp_io = 0;
 
-    // unsigned int lingen_threshold;
+    unsigned int lingen_threshold = 2048;   /* bw-local: no tuning stage */
     // unsigned int lingen_mpi_threshold;
     
     std::array<int, 2> mpi_dims = { 1, 1 }; /* mpi_dims[0] = mpi[0] * thr[0] */

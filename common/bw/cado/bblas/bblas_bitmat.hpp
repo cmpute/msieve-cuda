@@ -15,6 +15,9 @@
 
 template<typename T> class bitmat;
 
+/* bw-local: aligned_allocator comes from cado utils/memory.h */
+#include "memory.h"
+
 namespace bblas_bitmat_details {
 
     template<typename T> struct bblas_bitmat_type_supported {

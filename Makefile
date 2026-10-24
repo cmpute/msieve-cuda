@@ -331,7 +331,58 @@ GF2X_DIR = common/bw/gf2x
 GF2X_LIB = $(GF2X_DIR)/.libs/libgf2x.a
 GF2X_STAMP = $(GF2X_DIR)/bw-stamp-configured
 
-BW_CXXFLAGS = -O2 -g -std=c++14 -fopenmp \
+BW_CADO_BWC_CPP = \
+	common/bw/cado/bwc/lingen.cpp \
+	common/bw/cado/bwc/lingen_bmstatus.cpp \
+	common/bw/cado/bwc/lingen_call_companion.cpp \
+	common/bw/cado/bwc/lingen_expected_pi_length.cpp \
+	common/bw/cado/bwc/lingen_average_matsize.cpp \
+	common/bw/cado/bwc/lingen_hints.cpp \
+	common/bw/cado/bwc/lingen_memory_pool.cpp \
+	common/bw/cado/bwc/lingen_round_operand_size.cpp \
+	common/bw/cado/bwc/lingen_io_matpoly.cpp \
+	common/bw/cado/bwc/lingen_io_wrappers.cpp \
+	common/bw/cado/bwc/lingen_matpoly_binary.cpp \
+	common/bw/cado/bwc/lingen_qcode_binary.cpp \
+	common/bw/cado/bwc/tree_stats.cpp \
+	common/bw/cado/bwc/logline.cpp
+
+BW_CADO_BBLAS_CPP = \
+	common/bw/cado/bblas/bpack.cpp \
+	common/bw/cado/bblas/bblas_mat64.cpp \
+	common/bw/cado/bblas/bblas_mat8.cpp \
+	common/bw/cado/bblas/bblas_level2a.cpp \
+	common/bw/cado/bblas/bblas_level2b.cpp \
+	common/bw/cado/bblas/bblas_level3a.cpp \
+	common/bw/cado/bblas/bblas_level3a1.cpp \
+	common/bw/cado/bblas/bblas_level3b.cpp \
+	common/bw/cado/bblas/bblas_level3c.cpp \
+	common/bw/cado/bblas/bblas_level3d.cpp \
+	common/bw/cado/bblas/bblas_level4_echelon.cpp \
+	common/bw/cado/bblas/bblas_level4_gauss.cpp \
+	common/bw/cado/bblas/bblas_level4_lup.cpp
+
+BW_CADO_UTILS_CPP = \
+	common/bw/cado/utils/cxx_mpz.cpp \
+	common/bw/cado/utils/utils_cxx.cpp \
+	common/bw/cado/utils/timing.cpp
+
+# fmt.cc is a C++20 module unit; use the classic translation units
+BW_FMT_CPP = \
+	common/bw/cado/utils/embedded/fmt/format.cc \
+	common/bw/cado/utils/embedded/fmt/os.cc
+
+BW_CADO_C = \
+	common/bw/cado/bblas/bblas_gauss.c \
+	common/bw/cado/utils/gmp_aux.c \
+	common/bw/cado/utils/misc.c \
+	common/bw/cado/utils/sha1.c 	common/bw/cado/utils/getprime.c 	common/bw/cado/utils/memory.c \
+	common/bw/shims/memusage_stub.c
+
+BW_CADO_OBJS = $(BW_CADO_BWC_CPP:.cpp=.bwx) $(BW_CADO_BBLAS_CPP:.cpp=.bwx) \
+	$(BW_CADO_UTILS_CPP:.cpp=.bwx) $(BW_CADO_C:.c=.bwxo) $(BW_FMT_CPP:.cc=.bwx)
+
+BW_CXXFLAGS = -O2 -g -std=c++20 -fopenmp -march=native \
 	-DLINGEN_BINARY -DBW_NO_MPI \
 	-Icommon/bw -Icommon/bw/cado -Icommon/bw/cado/bwc \
 	-Icommon/bw/cado/bblas -Icommon/bw/cado/utils \
@@ -359,16 +410,36 @@ $(BW_OBJS): %.bwo: %.c $(COMMON_HDR)
 common/bw/bw_lingen.bwx: common/bw/bw_lingen.cpp
 	$(CXX) $(BW_CXXFLAGS) -c -o $@ $<
 
+%.bwx: %.cpp
+	$(CXX) $(BW_CXXFLAGS) -c -o $@ $<
+
+common/bw/cado/utils/embedded/fmt/format.bwx: common/bw/cado/utils/embedded/fmt/format.cc
+	$(CXX) $(BW_CXXFLAGS) -c -o $@ $<
+common/bw/cado/utils/embedded/fmt/os.bwx: common/bw/cado/utils/embedded/fmt/os.cc
+	$(CXX) $(BW_CXXFLAGS) -c -o $@ $<
+
+%.bwxo: %.c
+	$(CC) $(CFLAGS) -Icommon/bw/shims -Icommon/bw/cado -Icommon/bw/cado/bblas -Icommon/bw/cado/utils -c -o $@ $<
+
+bw_lingen_test: common/bw/bw_lingen_test.bwo $(BW_LINGEN_OBJ) \
+		$(BW_CADO_OBJS) $(GF2X_LIB)
+	$(CXX) $(CFLAGS) -o $@ common/bw/bw_lingen_test.bwo \
+		$(BW_LINGEN_OBJ) $(BW_CADO_OBJS) $(GF2X_LIB) \
+		-lgmp -fopenmp
+
+common/bw/bw_lingen_test.bwo: common/bw/bw_lingen_test.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
 bw_test: common/bw/bw_selftest.bwo $(BW_OBJS) $(BW_KERNEL_OBJ) \
-		$(BW_LINGEN_OBJ) $(GF2X_LIB) libmsieve.a
+		$(BW_LINGEN_OBJ) $(BW_CADO_OBJS) $(GF2X_LIB) libmsieve.a
 	$(CXX) $(CFLAGS) -o $@ common/bw/bw_selftest.bwo $(BW_OBJS) \
-		$(BW_KERNEL_OBJ) $(BW_LINGEN_OBJ) $(GF2X_LIB) \
+		$(BW_KERNEL_OBJ) $(BW_LINGEN_OBJ) $(BW_CADO_OBJS) $(GF2X_LIB) \
 		libmsieve.a $(LIBS)
 
 common/bw/bw_selftest.bwo: common/bw/bw_selftest.c $(COMMON_HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-BW_ALL = $(BW_OBJS) $(BW_KERNEL_OBJ) $(BW_LINGEN_OBJ)
+BW_ALL = $(BW_OBJS) $(BW_KERNEL_OBJ) $(BW_LINGEN_OBJ) $(BW_CADO_OBJS)
 endif
 
 #---------------------------------- NFS file lists -------------------------
@@ -470,7 +541,7 @@ help:
 
 all: demo.o $(COMMON_OBJS) $(QS_OBJS) $(NFS_OBJS) $(GPU_OBJS) $(BW_ALL) $(GF2X_LIB)
 	rm -f libmsieve.a
-	ar r libmsieve.a $(COMMON_OBJS) $(QS_OBJS) $(NFS_OBJS) $(CUDA_ARCHIVE_OBJS) $(BW_OBJS) $(BW_KERNEL_OBJ) $(BW_LINGEN_OBJ)
+	ar r libmsieve.a $(COMMON_OBJS) $(QS_OBJS) $(NFS_OBJS) $(CUDA_ARCHIVE_OBJS) $(BW_ALL)
 	ranlib libmsieve.a
 	$(LINKER) $(CFLAGS) -o msieve $(LDFLAGS) demo.o libmsieve.a $(LIBS) $(GF2X_LIB)
 
@@ -479,7 +550,11 @@ clean:
 	rm -f msieve msieve.exe demo.o libmsieve.a $(COMMON_OBJS) $(QS_OBJS) \
 		$(COMMON_GPU_OBJS) $(NFS_OBJS) $(NFS_GPU_OBJS) $(NFS_NOGPU_OBJS) \
 		$(CUDA_ENGINE_OBJS) $(CUDA_EMBED_OBJS) *.ptx *.fatbin *_embed.c \
-		common/bw/*.bwo common/bw/*.bwx common/bw/bw_kernel.o bw_test \
+		common/bw/*.bwo common/bw/*.bwx common/bw/cado/bwc/*.bwx \
+		common/bw/cado/bblas/*.bwx common/bw/cado/utils/*.bwx \
+		common/bw/cado/utils/*.bwxo \
+		common/bw/cado/utils/embedded/fmt/*.bwx \
+		common/bw/bw_kernel.o bw_test bw_lingen_test \
 		msieve_bin2c msieve_bin2c.exe
 	if [ -f common/bw/gf2x/Makefile ]; then \
 		cd common/bw/gf2x && $(MAKE) distclean || true; \

@@ -32,7 +32,9 @@
 #include "lingen_average_matsize.hpp"
 #include "lingen_bmstatus.hpp"
 #include "lingen_matpoly_select.hpp"
-#include "lingen_bigmatpoly.hpp"
+/* bw-local: MPI bigmatpoly not vendored; forward decl keeps the
+ * (never-taken) if-constexpr branch nameable */
+template<bool is_binary> class bigmatpoly;
 #include "lingen_io_matpoly.hpp"
 #include "lingen_io_wrappers.hpp"
 #include "macros.h"
@@ -1537,11 +1539,9 @@ template class lingen_F_from_PI<true>;
 template class lingen_file_input<true>;
 template struct lingen_random_input<true>;
 template class lingen_scatter<matpoly<true>>;
-template class lingen_scatter<bigmatpoly<true>>;
+/* bw-local: bigmatpoly (MPI) instantiations dropped */
 template class lingen_gather<matpoly<true>>;
-template class lingen_gather<bigmatpoly<true>>;
 template class lingen_gather_reverse<matpoly<true>>;
-template class lingen_gather_reverse<bigmatpoly<true>>;
 template
 void
 pipe<true>(lingen_input_wrapper_base<true> & in,

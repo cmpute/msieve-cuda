@@ -15,7 +15,7 @@
 #include "lingen_matpoly_binary.hpp"
 #include "omp_proxy.h"
 #include "macros.h"
-#include "arith-hard.hpp"
+/* bw-local: arith-hard not vendored; matpoly<true>::arith_hard is self-contained */
 #include "misc.h"
 #include "gf2x.h"
 #include "runtime_numeric_cast.hpp"

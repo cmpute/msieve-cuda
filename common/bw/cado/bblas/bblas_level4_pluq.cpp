@@ -9,7 +9,7 @@
 #include "bblas_level4.hpp"
 #include "bblas_perm_matrix.hpp"
 #include "bblas_simd.hpp"
-#include "linalg/bblas/bblas_bitmat.hpp"   // for bitmat<>::vector_type
+/* bw-local path */ #include "bblas_bitmat.hpp"   // for bitmat<>::vector_type
 #include "linalg/bblas/bblas_level3a.hpp"  // for mat64_add
 #include "linalg/bblas/bblas_level3b.hpp"  // for mul_6464_6464
 #include "linalg/bblas/bblas_mat64.hpp"    // for mat64

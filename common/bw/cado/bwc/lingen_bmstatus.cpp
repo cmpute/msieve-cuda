@@ -26,10 +26,26 @@ lingen_call_companion & bmstatus<is_binary>::companion(int depth, size_t L)/*{{{
     int rank;
     MPI_Comm_rank(com[0], &rank);
 
-    if (!rank)
-        fprintf(stderr, "# No tuned configuration for"
-                " depth=%d input_length=%zu\n",
-                depth, L);
+    /* bw-local: no tuning stage in this port; synthesize a complete
+     * companion on demand. Recurse iff the input length is at or
+     * above lingen_threshold (bm.d.lingen_threshold, set by the
+     * driver); mesh=1 means "recurse, single process". */
+    {
+        lingen_call_companion c;
+        c.complete = true;
+        /* leaf floor: subproblem sizes below this hit degenerate
+         * substep schedules (only relevant for tiny test inputs) */
+        c.mesh = (L >= (size_t) lingen_threshold && L >= 64) ? 1 : 0;
+        c.total_ncalls = 1;
+        /* stats planning budget: generous, so the harmless double-count
+         * case (same substep name twice at one level, see the long
+         * comment in tree_stats.cpp) cannot trip the accounting assert */
+        c.mp.tt = { 4, 0 };
+        c.mul.tt = { 4, 0 };
+        c.ttb = 0;
+        hints[K] = c;
+        return hints[K];
+    }
 
     struct same_depth {
         int d;

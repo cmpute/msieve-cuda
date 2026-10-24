@@ -43,9 +43,12 @@ Directory map
                        (b5ca9c4 root, generated header archived as-is).
                        LGPL-2.1+.
 
-  cado/utils/          gmp_aux, cxx_mpz, gmp_auxx, utils_cxx, params,
-                       timing, misc, omp_proxy, runtime_numeric_cast
-                       from b5ca9c4 utils/. LGPL-2.1+.
+  cado/utils/          gmp_aux, cxx_mpz, gmp_auxx, utils_cxx, timing,
+                       misc, omp_proxy, runtime_numeric_cast, memory,
+                       getprime, sha1, portability from b5ca9c4 utils/.
+                       params.hpp is replaced by a stub (the original
+                       drags in the verbose/version_info layer this port
+                       does not compile). LGPL-2.1+.
                        cado/utils/embedded/ is the {fmt} core
                        (MIT licensed, upstream fmtlib/fmt) as bundled
                        by cado; see cado/utils/embedded/LICENSE if
@@ -53,8 +56,13 @@ Directory map
                        https://github.com/fmtlib/fmt/blob/master/LICENSE.
 
   cado/shims/          NEW files, public domain: cado_config.h,
-                       cado.h, select_mpi.h and the other compile-time
-                       stand-ins that replace cado's build system.
+                       cado.h, select_mpi.h, lingen_fft_select.hpp,
+                       memusage.h and the other compile-time stand-ins
+                       that replace cado's build system.
+
+  bw_lingen_test.c     NEW, public domain: random-recurrence validation
+                       of the ported lingen (polynomial identity
+                       A(x)*F(x) = 0 on the interior window).
 
   gf2x/                The gf2x library vendored from b5ca9c4 gf2x/
                        (upstream https://gforge.inria.fr/projects/gf2x/

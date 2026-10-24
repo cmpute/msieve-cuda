@@ -15,8 +15,8 @@
 #include <sys/types.h>
 
 #include "gmp_aux.h"
-#include "arith-hard.hpp"
-#include "lingen_bigmatpoly.hpp"
+/* bw-local: arith-hard not vendored */
+/* bw-local: bigmatpoly (MPI) not vendored */
 #include "lingen_bw_dimensions.hpp"
 #include "lingen_matpoly_select.hpp"
 #include "macros.h"
