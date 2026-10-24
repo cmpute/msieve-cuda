@@ -186,6 +186,7 @@ void bw_anyset64(const uint64_t *x, uint64_t *flag, size_t n,
 	/* flag[0] |= OR of x[0..n); flag is zeroed first */
 
 int bw_preflight(int dev);  /* occupancy checks; 0 ok, -1 fail */
+long long bw_l2_bytes(int dev);
 
 #ifdef __cplusplus
 }

@@ -459,7 +459,7 @@ uint64_t *bw_solve(msieve_obj *obj,
 
 	/* matrix packaging (slabs in GPU list order) */
 	if (bw_matrix_build(&M, obj, nrows, num_dense_rows, ncols, cols,
-			o.num_gpus, o.block_nnz)) {
+			o.num_gpus, o.block_nnz, o.gpus[0])) {
 		logprintf(obj, "error: BW matrix packaging failed\n");
 		goto fail;
 	}

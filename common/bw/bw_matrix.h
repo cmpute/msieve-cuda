@@ -59,7 +59,8 @@ typedef struct {
    pack_matrix_block / radix_sort logic. Does not free cols[] data. */
 int bw_matrix_build(bw_matrix_t *M, msieve_obj *obj,
 		uint32_t nrows, uint32_t num_dense_rows, uint32_t ncols,
-		la_col_t *cols, uint32_t num_slabs, uint64_t block_nnz);
+		la_col_t *cols, uint32_t num_slabs, uint64_t block_nnz,
+		int l2_dev);
 
 void bw_matrix_free(bw_matrix_t *M);   /* host packaging only */
 

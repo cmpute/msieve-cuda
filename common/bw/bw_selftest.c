@@ -157,7 +157,7 @@ static int make_random_matrix(msieve_obj *obj, la_col_t **cols_out,
 
 	*cols_out = cols;
 	if (bw_matrix_build(M, obj, nrows, ndr, ncols, cols,
-			num_slabs, 1 << 20))
+			num_slabs, 1 << 20, 1))
 		return -1;
 	return 0;
 }

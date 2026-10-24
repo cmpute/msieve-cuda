@@ -251,6 +251,16 @@ occupancy preflights: launch-bound sanity for every kernel above;
 a zero here means the configuration is unusable and must be a hard
 error, never a silent clamp.
 --------------------------------------------------------------------*/
+extern "C" long long bw_l2_bytes(int dev)
+{
+	/* L2 size for the block-window formula; a property query only */
+	cudaDeviceProp prop;
+	cudaError_t e = cudaGetDeviceProperties(&prop, dev);
+	if (e != cudaSuccess || prop.l2CacheSize <= 0)
+		return 96LL << 20;      /* L20-ish fallback */
+	return (long long)prop.l2CacheSize;
+}
+
 extern "C" int bw_preflight(int dev)
 {
 	cudaError_t e;

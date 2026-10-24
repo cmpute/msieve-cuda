@@ -321,7 +321,8 @@ static int bw_build_dense(bw_matrix_t *M, la_col_t *cols)
 /*-------------------------------------------------------------------*/
 int bw_matrix_build(bw_matrix_t *M, msieve_obj *obj,
 		uint32_t nrows, uint32_t num_dense_rows, uint32_t ncols,
-		la_col_t *cols, uint32_t num_slabs, uint64_t block_nnz)
+		la_col_t *cols, uint32_t num_slabs, uint64_t block_nnz,
+		int l2_dev)
 {
 	uint32_t bounds[BW_MAX_GPUS + 1];
 	uint32_t s, col_min;
@@ -349,13 +350,30 @@ int bw_matrix_build(bw_matrix_t *M, msieve_obj *obj,
 	if (avg_col_weight == 0)
 		avg_col_weight = 1;
 
-	/* clamp the requested block_nnz the same way the Lanczos packer
-	   does, but as a *window width* target: the per-slab extraction
-	   below asks for block_nnz * (slab nnz fraction) nonzeros */
-	if (block_nnz < 100000)
-		block_nnz = 100000;
-	if (block_nnz > BW_MAX_BLOCK_NNZ)
-		block_nnz = BW_MAX_BLOCK_NNZ;
+	/* block_nnz == 0: L2-calibrated auto (the formula the live
+	   single-GPU Lanczos run uses; the column-window width stays
+	   P-independent). An explicit request is honoured as-is after
+	   range clamping. */
+	{
+		uint64_t avg_col_weight = M->sparse_weight ?
+			(M->sparse_weight + M->ncols - 1) / M->ncols : 1;
+		if (avg_col_weight == 0)
+			avg_col_weight = 1;
+		if (block_nnz == 0)
+			block_nnz = 128000000ull;
+		{
+			/* (L2/2)/sizeof(v_t) * avg weight, at least 128M */
+			long long l2 = bw_l2_bytes(l2_dev);
+			uint64_t want = (uint64_t)(l2 / 2 / 8) *
+					avg_col_weight;
+			if (want > block_nnz)
+				block_nnz = want;
+		}
+		if (block_nnz > BW_MAX_BLOCK_NNZ)
+			block_nnz = BW_MAX_BLOCK_NNZ;
+		logprintf(obj, "BW block_nnz %llu\n",
+				(unsigned long long)block_nnz);
+	}
 
 	M->slabs = (bw_slab_t *)xcalloc(num_slabs, sizeof(bw_slab_t));
 
