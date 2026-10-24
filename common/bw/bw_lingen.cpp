@@ -42,16 +42,31 @@ typedef struct {
 	uint64_t seq_len;
 	uint32_t threshold;
 	uint32_t nthreads;
+	uint32_t impl;           /* 0 = cado subquadratic, 1 = quad GPU */
+	uint32_t dev;            /* device for the quad basecase */
 } bw_lingen_opts_t;
+
+/* set from the bw=1 option string (bw.c, C linkage) */
+extern "C" {
+uint32_t g_bw_lingen_impl = 0;
+uint32_t g_bw_lingen_dev = 0;
+}
+extern "C" {
+int bw_lingen_quad_flag = 0;
+int bw_lingen_quad_dev = 0;
+}
 
 int bw_lingen_run(const bw_lingen_opts_t *o)
 {
 	cxx_mpz const p(2);
 	bmstatus<true> bm(o->m, o->n, p);
 	bm.lingen_threshold = o->threshold;
+	bw_lingen_quad_flag = (g_bw_lingen_impl == 1);
+	bw_lingen_quad_dev = (int)g_bw_lingen_dev;
 
-	if (o->nthreads)
+	if (o->nthreads > 0)
 		omp_set_num_threads((int)o->nthreads);
+	/* 0 = keep the machine-wide OpenMP default */
 
 	typename matpoly<true>::memory_guard const guard(SIZE_MAX);
 

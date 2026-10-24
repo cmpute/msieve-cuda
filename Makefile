@@ -311,6 +311,7 @@ BW_C_SRCS = \
 BW_OBJS = $(BW_C_SRCS:.c=.bwo)
 BW_KERNEL_OBJ = common/bw/bw_kernel.o
 BW_LINGEN_OBJ = common/bw/bw_lingen.bwx
+BW_QUAD_OBJ = common/bw/bw_lingen_quad.bwx common/bw/bw_lingen_quad_kernel.o
 
 ifeq ($(BW),1)
 ifndef CUDA
@@ -412,6 +413,13 @@ $(BW_OBJS): %.bwo: %.c $(COMMON_HDR) common/bw/bw.h common/bw/bw_gpu.h \
 common/bw/bw_lingen.bwx: common/bw/bw_lingen.cpp
 	$(CXX) $(BW_CXXFLAGS) -c -o $@ $<
 
+common/bw/bw_lingen_quad.bwx: common/bw/bw_lingen_quad.cpp
+	$(CXX) $(BW_CXXFLAGS) -c -o $@ $<
+
+common/bw/bw_lingen_quad_kernel.o: common/bw/bw_lingen_quad.cu
+	$(NVCC) $(CUDA_FATBIN_GENCODE) $(CUDA_HOST_FLAGS) -O3 -std=c++17 \
+		-Icommon/bw -c -o $@ $<
+
 %.bwx: %.cpp | $(GF2X_STAMP)
 	$(CXX) $(BW_CXXFLAGS) -c -o $@ $<
 
@@ -424,26 +432,29 @@ common/bw/cado/utils/embedded/fmt/os.bwx: common/bw/cado/utils/embedded/fmt/os.c
 	$(CC) $(CFLAGS) -Icommon/bw/shims -Icommon/bw/cado -Icommon/bw/cado/bblas -Icommon/bw/cado/utils -c -o $@ $<
 
 bw_lingen_test: common/bw/bw_lingen_test.bwo $(BW_LINGEN_OBJ) \
-		$(BW_CADO_OBJS) $(GF2X_LIB)
+		$(BW_QUAD_OBJ) $(BW_CADO_OBJS) $(GF2X_LIB)
 	$(CXX) $(CFLAGS) -o $@ common/bw/bw_lingen_test.bwo \
-		$(BW_LINGEN_OBJ) $(BW_CADO_OBJS) $(GF2X_LIB) \
-		-lgmp -fopenmp
+		$(BW_LINGEN_OBJ) $(BW_QUAD_OBJ) $(BW_CADO_OBJS) \
+		$(GF2X_LIB) -lgmp -fopenmp \
+		-L"$(CUDA_ROOT)/lib64" -lcudart_static -ldl -lrt \
+		-L"$(CUDA_ROOT)/compat/lib"
 
 common/bw/bw_lingen_test.bwo: common/bw/bw_lingen_test.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 bw_test: common/bw/bw_selftest.bwo $(BW_OBJS) $(BW_KERNEL_OBJ) \
-		$(BW_LINGEN_OBJ) $(BW_CADO_OBJS) $(GF2X_LIB) libmsieve.a
+		$(BW_LINGEN_OBJ) $(BW_QUAD_OBJ) $(BW_CADO_OBJS) $(GF2X_LIB) \
+		libmsieve.a
 	$(CXX) $(CFLAGS) -o $@ common/bw/bw_selftest.bwo $(BW_OBJS) \
-		$(BW_KERNEL_OBJ) $(BW_LINGEN_OBJ) $(BW_CADO_OBJS) $(GF2X_LIB) \
-		libmsieve.a $(LIBS)
+		$(BW_KERNEL_OBJ) $(BW_LINGEN_OBJ) $(BW_QUAD_OBJ) \
+		$(BW_CADO_OBJS) $(GF2X_LIB) libmsieve.a $(LIBS)
 
 common/bw/bw_selftest.bwo: common/bw/bw_selftest.c $(COMMON_HDR) \
 			common/bw/bw.h common/bw/bw_gpu.h common/bw/bw_matrix.h \
 			common/bw/bw_seq.h common/bw/bw_checkpoint.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-BW_ALL = $(BW_OBJS) $(BW_KERNEL_OBJ) $(BW_LINGEN_OBJ) $(BW_CADO_OBJS)
+BW_ALL = $(BW_OBJS) $(BW_KERNEL_OBJ) $(BW_LINGEN_OBJ) $(BW_QUAD_OBJ) $(BW_CADO_OBJS)
 endif
 
 #---------------------------------- NFS file lists -------------------------

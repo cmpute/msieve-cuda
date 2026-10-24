@@ -19,6 +19,11 @@ Option parsing and phase sequencing for the Block Wiedemann solver.
 #include <time.h>
 #include <sys/stat.h>
 
+/* lingen impl selection, read by bw_lingen_run; defined there so
+ * the lingen test link needs no bw.c objects */
+extern uint32_t g_bw_lingen_impl;
+extern uint32_t g_bw_lingen_dev;
+
 /* lingen C ABI (bw_lingen.cpp) */
 typedef struct {
 	uint32_t m, n;
@@ -28,6 +33,8 @@ typedef struct {
 	uint64_t seq_len;
 	uint32_t threshold;
 	uint32_t nthreads;
+	uint32_t impl;           /* 0 = cado subquadratic, 1 = quad GPU */
+	uint32_t dev;            /* device for the quad basecase */
 } bw_lingen_opts_t;
 
 extern int bw_lingen_run(const bw_lingen_opts_t *o);
@@ -187,6 +194,11 @@ static int bw_opt_one(bw_opts_t *o, const char *key, const char *val,
 	}
 	else if (!strcmp(key, "bw_keep")) {
 		o->keep = (val[0] == '1');
+	}
+	else if (!strcmp(key, "bw_lingen_impl")) {
+		/* stored globally; bw_lingen_run picks it up */
+		extern uint32_t g_bw_lingen_impl;
+		g_bw_lingen_impl = !strcmp(val, "quad");
 	}
 	else {
 		logprintf(obj, "error: unknown BW option '%s'\n", key);
@@ -517,11 +529,12 @@ uint64_t *bw_solve(msieve_obj *obj,
 		lo.n = o.n;
 		lo.nrows = nrows;
 		lo.ncols = ncols;
+		g_bw_lingen_dev = o.gpus[0];
 		lo.afile = apath;
 		lo.ffile = fpath;
 		lo.seq_len = L;
 		lo.threshold = o.lingen_threshold;
-		lo.nthreads = 1;
+		lo.nthreads = 0;   /* 0 = keep omp default (machine threads) */
 		if (bw_lingen_run(&lo)) {
 			logprintf(obj, "error: BW lingen failed\n");
 			goto fail_after_gpu;

@@ -17,14 +17,20 @@ nondegenerate (nonzero, and not the trivial low-degree identity).
 
 typedef struct {
 	uint32_t m, n;
+	uint32_t nrows, ncols;
 	const char *afile;
 	const char *ffile;
 	uint64_t seq_len;
 	uint32_t threshold;
 	uint32_t nthreads;
+	uint32_t impl;
+	uint32_t dev;
 } bw_lingen_opts_t;
 
 extern int bw_lingen_run(const bw_lingen_opts_t *o);
+/* impl selection, defined in bw_lingen.cpp */
+extern unsigned int g_bw_lingen_impl;
+extern unsigned int g_bw_lingen_dev;
 
 /* bw_seq.h formats */
 #define BW_A_MAGIC   0x31574241u
@@ -142,6 +148,10 @@ int main(int argc, char **argv)
 		o.seq_len = L;
 		o.threshold = threshold;
 		o.nthreads = 4;
+		if (getenv("QUAD")) {
+			g_bw_lingen_impl = 1;
+			g_bw_lingen_dev = 1;
+		}
 		if (bw_lingen_run(&o)) {
 			printf("LINGEN TEST FAIL: bw_lingen_run errored\n");
 			return 1;
