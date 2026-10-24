@@ -46,10 +46,29 @@ Branch `block-wiedemann` in this worktree (base msieve 0f25603 + lpbound patch).
    bw_krylov.o with an older bw_worker_t ABI caused cross-TU struct
    layout mismatches).
 
+## RSA-100 closed loop (2026-10-24, complete)
+
+poly 6 min (GPU1) -> cuda-sieve 20M relations in ~3.5 min ->
+msieve filter (matrix 399k x 399k + excess, 91 dense rows) ->
+BW on GPUs 1,2,3: Krylov 6 s, lingen 69 s, mksol 3 s, 64
+CPU-verified dependencies, BWTime 102 s -> sqrt dependency #2:
+
+  p50 factor: 37975227936943673922808872755445627854565536638199
+  p50 factor: 40094690950920881030683735292761468389214899724061
+
+Both match the published RSA-100 factors. (Dependency #1 gave
+GCD 1 -- the expected coin flip per dependency; msieve's sqrt
+tries one dep by default, `-nc3 "dep_first=N dep_last=N"` selects
+another. Note dep_first/dep_last must be space-separated: a comma
+triggers sqrt.c's legacy 'X,Y' override parser.)
+
+The Lanczos differential on the same matrix: BL 85 s -> same two
+factors from its dep #1, confirming the matrix/cycle/fb pipeline;
+BW's LA GPU time (Krylov+mksol, ~9 s on 3 GPUs) vs BL 85 s.
+
 ## Open (next session)
 
-- RSA-100 full closed loop (poly -> cuda-sieve -> filter -> BW -> sqrt
-  vs known factors); multi-GPU scaling table on that matrix.
+- multi-GPU scaling table on this matrix (1 vs 2 vs 3 GPUs).
 - -ncr resume path exercised only via checkpoint unit tests.
 - C254/C264 benchmarks (M4/M5), (m,n) sweeps (M6), hierarchical
   allgather, lingen OpenMP/GPL-Toom levers.
