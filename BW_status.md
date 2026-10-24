@@ -230,3 +230,63 @@ gather) and merge at lingen input. The 4-GPU row waits for GPU0
 - -ncr resume path exercised only via checkpoint unit tests.
 - C254/C264 benchmarks (M4/M5), (m,n) sweeps (M6), hierarchical
   allgather, lingen OpenMP/GPL-Toom levers.
+
+## Negative Krylov scaling: instrumented verdict + plane split (2026-10-24, late)
+
+BW_TIME=1 instrumentation (worker wall-clock phases + a CUDA event
+span per step, printed per phase by bw_gpu_time_report). Same box,
+same BL-job CPU contention, GPUs 1-3 (RSA-120 matrix, m=128 n=64,
+N=2.1M, L=49408; runs earlier in the evening used GPU lists 1 / 1,2
+/ 1,2,3):
+
+  krylov, per step:      1 gpu      2 gpus          3 gpus
+    gpu compute (max)    1.287 ms   0.810 ms        0.471 ms
+    exchanged/step       0          16.8 MB         16.9 MB in+out/GPU
+    step wall            ~1.4 ms    1.84 ms         2.17 ms
+    phase total          69 s       91 s            107 s
+  mksol (staged path):   64 s       89 s            64 s
+
+Verdict: communication, and provably not an implementation knob.
+(a) peer pushes already run at wire speed (~16 GB/s effective on
+this gen4 link: w2's 29.9 MB push = 1.66 ms); (b) the exchange
+window cannot shrink -- the NFS matrix has no band structure (each
+slab is ONE CSR block spanning all columns), so every step must
+replicate the full 16.8 MB state vector; (3) spmv -> gather -> spmv
+is a strict dependency chain, no overlap. Comm added (~1.0-1.7 ms)
+exceeds compute saved (1.29 -> 0.81/0.47) at every W, so row slabs
+are NET NEGATIVE at any NFS size on this box (both terms scale with
+N at fixed density). Bonus finding: a lone worker's mksol paid a
+full 16.8 MB D2H per step (staged path never skipped the no-peers
+case) = ~26 of its 64 s.
+
+Fix (user-approved): bw_split=plane. Every GPU holds a full matrix
+replica and a contiguous share of the 64 state bit-planes; spmv and
+the oprod are plane-independent, the mksol combine is masked to the
+local planes (kernel param), Y0/U stay full per GPU, zero per-step
+communication. The S partials XOR-merge as before, collect/checkpoint
+OR-merge (bw_gpu_merge_state), resume re-masks on upload. A-file and
+F formats, lingen, deps: untouched (bit-exact same math). The
+no-exchange fast path also covers W=1, killing the wasted D2H there.
+Fellows: bw.c (bw_split key + MSIEVE_BW_SPLIT, 1-slab build +
+bw_matrix_replicate_slabs), bw_gpu.c/h (plane ranges/masks, gates,
+masked uploads, skip-allgather), bw_kernel.cu (combine mask),
+bw_krylov/bw_mksol (merge helper), bw_selftest (--split=plane).
+
+Validation: identity + closed-loop selftests green in plane mode on
+2/3 GPUs and unchanged in rows mode; RSA-100 plane e2e reproduces
+the published p50 pair (47 deps, same as rows).
+
+Plane timing rows (RSA-120, GPUs 1-3, same evening conditions):
+  gpus | krylov | mksol | deps      (rows-mode reference: 69/91/107 + 64/89/64)
+    1   |   s    |   s   | 44
+    2   |   s    |   s   | 44
+    3   |   s    |   s   | 44
+
+Expectation from the component numbers: krylov ~= the 1-GPU row at
+any W (full-matrix compute per GPU, no exchange) and mksol ~38 s
+(compute 1.03 ms/step + no staging). Plane split buys parity, not
+positive scaling: with n=64 the state is 1 word/row and word-granular
+gathers cannot charge less for fewer active planes. Positive scaling
+needs n=128 (2 words/row, L halves) -- recorded as the next
+candidate (M7), along with lingen (now the dominant phase: 183-760 s
+under CPU contention).

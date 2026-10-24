@@ -73,6 +73,19 @@ struct bw_worker {
 				    of every dependency */
 	uint64_t h_flag;         /* slab-zero flag after NIL_STEP */
 	int cuda_error;          /* first error code, sticky */
+
+	/* plane split: this worker's share of the 64 state bit-planes.
+	   In rows mode lo=0/hi=64/mask=~0 (the mask only gates the
+	   mksol combine, which stays a no-op there) */
+	uint32_t plane_lo, plane_hi;
+	uint64_t plane_mask;
+
+	/* BW_TIME=1 phase accounting, milliseconds; read by the parked
+	   main thread between phases (workers sit at b_start then) */
+	double t_submit, t_copy_sync, t_bar_mid, t_bar_end, t_bar_start;
+	double t_gpu_compute;    /* event span compute-stream head..ev_comp */
+	uint64_t n_steps;
+	cudaEvent_t ev_t0;
 };
 
 struct bw_group {
@@ -98,6 +111,11 @@ struct bw_group {
 	/* peer-access matrix and allgather mode */
 	int can_peer[BW_MAX_GPUS][BW_MAX_GPUS];
 	int use_peer;            /* 1 if every ordered pair has access */
+	int plane_split;         /* bw_split=plane with >1 workers: each
+				   worker owns a contiguous share of the
+				   64 state bit-planes over the full
+				   matrix; no per-step exchange */
+	int timing;              /* BW_TIME=1: workers accumulate phases */
 
 	/* host-side shared inputs/outputs */
 	const uint64_t *h_y0;    /* N words */
@@ -143,6 +161,10 @@ static inline void bw_gpu_upload_x(bw_group_t *g, const uint64_t *x) {
 
 void bw_gpu_stop(bw_group_t *g);   /* BW_CMD_STOP + join + free */
 
+/* BW_TIME=1 phase summaries; call between phases (workers parked) */
+void bw_gpu_time_report(bw_group_t *g, msieve_obj *obj, const char *phase);
+void bw_gpu_time_reset(bw_group_t *g);
+
 /* XOR all worker partials into out (m words); also return the OR of
    worker zero-flags (NIL_STEP) */
 static inline void bw_gpu_reduce_s(bw_group_t *g, uint64_t *out, uint32_t m) {
@@ -152,6 +174,44 @@ static inline void bw_gpu_reduce_s(bw_group_t *g, uint64_t *out, uint32_t m) {
 	for (w = 0; w < g->num_workers; w++)
 		for (i = 0; i < m; i++)
 			out[i] ^= g->w[w].h_s[i];
+}
+
+/* assemble the full state (N words) from a COLLECT round: rows mode
+   stitches the row slabs (disjoint), plane mode ORs the per-plane
+   partials of the full range plus the padded tails */
+static inline void bw_gpu_merge_state(bw_group_t *g, uint64_t *out) {
+	int w;
+	uint32_t i;
+	if (!g->plane_split) {
+		for (w = 0; w < g->num_workers; w++) {
+			bw_slab_t *slab = g->M->slabs + w;
+			memcpy(out + slab->xfer_min, g->w[w].h_stage,
+				(size_t)(slab->row_max -
+					slab->xfer_min) * 8);
+		}
+		if (g->w[0].h_tail)
+			memcpy(out + g->M->nrows, g->w[0].h_tail,
+				(size_t)(g->N - g->M->nrows) * 8);
+		else
+			memset(out + g->M->nrows, 0,
+				(size_t)(g->N - g->M->nrows) * 8);
+	}
+	else {
+		memset(out, 0, (size_t)g->N * 8);
+		for (w = 0; w < g->num_workers; w++) {
+			bw_slab_t *slab = g->M->slabs + w;
+			uint32_t n = slab->row_max - slab->xfer_min;
+			for (i = 0; i < n; i++)
+				out[slab->xfer_min + i] |=
+					g->w[w].h_stage[i];
+			if (g->w[w].h_tail) {
+				uint32_t tn = g->N - g->M->nrows;
+				for (i = 0; i < tn; i++)
+					out[g->M->nrows + i] |=
+						g->w[w].h_tail[i];
+			}
+		}
+	}
 }
 static inline int bw_gpu_all_zero(bw_group_t *g) {
 	int w;
@@ -173,8 +233,8 @@ void bw_oprod64(uint64_t *s, const uint64_t *u, const uint64_t *y,
 	   rows of y: s[64k+a] ^= bit a of u_k[i] ? y[i] */
 
 void bw_combine64(uint64_t *x, const uint64_t *y0, const uint64_t *fw,
-		size_t n, cudaStream_t stream);
-	/* x[i] ^= sum over set bits c of y0[i] of fw[c] */
+			uint64_t plane_mask, size_t n, cudaStream_t stream);
+	/* x[i] ^= sum over set bits c of y0[i] of (fw[c] & plane_mask) */
 
 void bw_dense64(uint64_t *y, const uint64_t *dense, const uint64_t *x,
 		uint32_t ndense_blocks, size_t n, cudaStream_t stream);

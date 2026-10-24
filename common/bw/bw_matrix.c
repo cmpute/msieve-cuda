@@ -475,6 +475,53 @@ int bw_matrix_build(bw_matrix_t *M, msieve_obj *obj,
 }
 
 /*-------------------------------------------------------------------*/
+/* plane split: the matrix was packed as a single full-range slab;
+   deep-copy its block descriptors so every worker sees the same
+   geometry (each GPU uploads its own device copy anyway) */
+int bw_matrix_replicate_slabs(bw_matrix_t *M, uint32_t num_slabs)
+{
+	bw_slab_t *slabs;
+	uint32_t s, b;
+
+	if (M->num_slabs != 1 || num_slabs < 1 || num_slabs > BW_MAX_GPUS)
+		return -1;
+	slabs = (bw_slab_t *)xcalloc(num_slabs, sizeof(bw_slab_t));
+	for (s = 0; s < num_slabs; s++) {
+		bw_slab_t *src = M->slabs;
+		slabs[s] = *src;
+		slabs[s].blocks = (bw_csrblock_t *)xmalloc(
+				src->num_blocks * sizeof(bw_csrblock_t));
+		memcpy(slabs[s].blocks, src->blocks,
+				src->num_blocks * sizeof(bw_csrblock_t));
+		for (b = 0; b < src->num_blocks; b++) {
+			bw_csrblock_t *sb = src->blocks + b;
+			bw_csrblock_t *d = slabs[s].blocks + b;
+			if (sb->row_entries) {
+				d->row_entries = (uint32_t *)xmalloc(
+					(sb->num_rows + 1) * sizeof(uint32_t));
+				memcpy(d->row_entries, sb->row_entries,
+					(sb->num_rows + 1) * sizeof(uint32_t));
+			}
+			if (sb->col_entries) {
+				d->col_entries = (uint32_t *)xmalloc(
+					sb->nnz * sizeof(uint32_t));
+				memcpy(d->col_entries, sb->col_entries,
+					sb->nnz * sizeof(uint32_t));
+			}
+		}
+	}
+	for (b = 0; b < M->slabs[0].num_blocks; b++) {  /* slab 0 owns */
+		free(M->slabs[0].blocks[b].row_entries);
+		free(M->slabs[0].blocks[b].col_entries);
+	}
+	free(M->slabs[0].blocks);
+	free(M->slabs);
+	M->slabs = slabs;
+	M->num_slabs = num_slabs;
+	return 0;
+}
+
+/*-------------------------------------------------------------------*/
 void bw_matrix_free(bw_matrix_t *M) {
 	uint32_t s, b;
 	for (s = 0; s < M->num_slabs; s++) {

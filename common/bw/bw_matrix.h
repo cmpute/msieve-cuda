@@ -64,4 +64,8 @@ int bw_matrix_build(bw_matrix_t *M, msieve_obj *obj,
 
 void bw_matrix_free(bw_matrix_t *M);   /* host packaging only */
 
+/* plane split: after a num_slabs==1 build, deep-copy the single
+   full-range slab to num_slabs identical ones (one per GPU) */
+int bw_matrix_replicate_slabs(bw_matrix_t *M, uint32_t num_slabs);
+
 #endif /* !_COMMON_BW_BW_MATRIX_H_ */

@@ -181,21 +181,11 @@ int bw_run_mksol(bw_group_t *g, msieve_obj *obj, const bw_opts_t *o,
 						"failure\n", w);
 				goto out;
 			}
-		for (w = 0; w < g->num_workers; w++) {
-			bw_slab_t *slab = g->M->slabs + w;
-			memcpy(deps_out + slab->xfer_min, g->w[w].h_stage,
-				(size_t)(slab->row_max -
-					slab->xfer_min) * 8);
-		}
-		/* the padded tail holds real columns' bits: they are part
-		   of every dependency (A*x = 0 needs them), replicated on
-		   every worker */
-		if (g->w[0].h_tail)
-			memcpy(deps_out + g->M->nrows, g->w[0].h_tail,
-				(size_t)(g->N - g->M->nrows) * 8);
-		else
-			memset(deps_out + g->M->nrows, 0,
-				(size_t)(g->N - g->M->nrows) * 8);
+		/* the padded tail [nrows,N) holds real columns' bits:
+		   part of every dependency (A*x = 0 needs them); plane
+		   mode ORs every worker's plane share, rows mode stitches
+		   the row slabs */
+		bw_gpu_merge_state(g, deps_out);
 	}
 
 
@@ -267,6 +257,9 @@ int bw_run_mksol(bw_group_t *g, msieve_obj *obj, const bw_opts_t *o,
 
 	logprintf(obj, "BW check: %u dependencies found\n", *ndeps_out);
 	rc = 0;
+
+	bw_gpu_time_report(g, obj, "mksol+nil");
+	bw_gpu_time_reset(g);
 
 out:
 	if (fbuf)

@@ -29,6 +29,10 @@ typedef struct {
 				   window width is P-independent) */
 	int peer;               /* -1 auto, 0 disable, 1 require */
 	int allgather_hier;     /* 0 flat, 1 hierarchical (PIX pairs) */
+	int split;              /* 0 row slabs (allgather per step),
+				   1 bit-plane split: every GPU holds the
+				   full matrix and 64/W planes of the
+				   state, zero per-step communication */
 	uint32 lingen_threshold;/* matrix-multiply recursion threshold */
 	uint32 checkpoint_s;    /* seconds between checkpoints */
 	uint64 seed;            /* extra seed material; 0 = derive */

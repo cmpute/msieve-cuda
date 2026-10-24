@@ -158,6 +158,9 @@ int bw_run_krylov(bw_group_t *g, msieve_obj *obj, const bw_opts_t *o,
 	}
 	rc = 0;
 
+	bw_gpu_time_report(g, obj, "krylov");
+	bw_gpu_time_reset(g);
+
 out:
 	if (a_fp)
 		fclose(a_fp);
@@ -186,11 +189,7 @@ static int krylov_checkpoint(bw_group_t *g, msieve_obj *obj,
 					"during checkpoint\n", w);
 			return -1;
 		}
-	for (w = 0; w < g->num_workers; w++) {
-		bw_slab_t *slab = g->M->slabs + w;
-		memcpy(scratch + slab->xfer_min, g->w[w].h_stage,
-			(size_t)(slab->row_max - slab->xfer_min) * 8);
-	}
+	bw_gpu_merge_state(g, scratch);
 
 	h = bw_fnv1a(0, scratch, (size_t)g->N * 8);
 

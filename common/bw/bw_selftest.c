@@ -106,7 +106,7 @@ static double rand_dense_density = 0.35;
 
 static int make_random_matrix(msieve_obj *obj, la_col_t **cols_out,
 		uint32_t nrows, uint32_t ncols, uint32_t ndr,
-		uint32_t num_slabs, bw_matrix_t *M)
+		uint32_t num_slabs, const bw_opts_t *o, bw_matrix_t *M)
 {
 	la_col_t *cols = (la_col_t *)xcalloc(ncols, sizeof(la_col_t));
 	uint32_t i, j, k;
@@ -157,7 +157,11 @@ static int make_random_matrix(msieve_obj *obj, la_col_t **cols_out,
 
 	*cols_out = cols;
 	if (bw_matrix_build(M, obj, nrows, ndr, ncols, cols,
-			num_slabs, 1 << 20, 1))
+			(o->split && num_slabs > 1) ? 1 : num_slabs,
+			1 << 20, 1))
+		return -1;
+	if (o->split && num_slabs > 1 &&
+			bw_matrix_replicate_slabs(M, num_slabs))
 		return -1;
 	return 0;
 }
@@ -190,7 +194,7 @@ static int run_case(msieve_obj *obj, uint32_t nrows, uint32_t ncols,
 		nrows, ncols, ndr, o->num_gpus);
 
 	if (make_random_matrix(obj, &cols, nrows, ncols, ndr,
-				o->num_gpus, &M))
+				o->num_gpus, o, &M))
 		goto out;
 	printf("[dbg] dense_weight=%" PRIu64 " blocks=%u sparse=%" PRIu64 "\n",
 		M.dense_weight, M.num_dense_blocks, M.sparse_weight);
@@ -222,11 +226,7 @@ static int run_case(msieve_obj *obj, uint32_t nrows, uint32_t ncols,
 		{
 			uint64_t *got = (uint64_t *)xcalloc(ncols, 8);
 			bw_gpu_collect(&g);
-			for (w = 0; w < g.num_workers; w++)
-				memcpy(got + M.slabs[w].xfer_min,
-					g.w[w].h_stage,
-					(M.slabs[w].row_max -
-					 M.slabs[w].xfer_min) * 8);
+			bw_gpu_merge_state(&g, got);
 			/* the padded tail must be zero after a step */
 			{
 				uint32_t t;
@@ -290,10 +290,7 @@ static int run_case(msieve_obj *obj, uint32_t nrows, uint32_t ncols,
 		memset(h_xcpu + nrows, 0, (ncols - nrows) * 8);
 		cpu_combine(h_xcpu, h_y0, f, 64, nrows);
 		bw_gpu_collect(&g);
-		for (w = 0; w < g.num_workers; w++)
-			memcpy(got + M.slabs[w].xfer_min, g.w[w].h_stage,
-				(M.slabs[w].row_max -
-				 M.slabs[w].xfer_min) * 8);
+		bw_gpu_merge_state(&g, got);
 		CHECK(memcmp(got, h_xcpu, nrows * 8) == 0,
 			"mksol step matches CPU");
 		free(got);
@@ -307,10 +304,7 @@ static int run_case(msieve_obj *obj, uint32_t nrows, uint32_t ncols,
 		uint64_t *full = (uint64_t *)xcalloc(ncols, 8);
 
 		bw_gpu_collect(&g);
-		for (i = 0; i < (uint32_t)g.num_workers; i++)
-			memcpy(full + M.slabs[i].xfer_min, g.w[i].h_stage,
-				(M.slabs[i].row_max -
-				 M.slabs[i].xfer_min) * 8);
+		bw_gpu_merge_state(&g, full);
 
 		memset(&hdr, 0, sizeof(hdr));
 		hdr.magic = BW_CHK_MAGIC;
@@ -388,7 +382,7 @@ static int run_case(msieve_obj *obj, uint32_t nrows, uint32_t ncols,
 		free(cols);
 		cols = NULL;
 		if (make_random_matrix(obj, &cols, nrows, ncols, ndr,
-					o->num_gpus, &M))
+					o->num_gpus, o, &M))
 			goto out;
 
 		/* fresh Y0/U with a NEW seed so the sequence differs */
@@ -507,14 +501,7 @@ static int run_case(msieve_obj *obj, uint32_t nrows, uint32_t ncols,
 						uint32_t w2;
 						int nz = 0;
 						bw_gpu_collect(&g);
-						for (w2 = 0; w2 < (uint32_t)g.num_workers; w2++)
-							memcpy(got + M.slabs[w2].xfer_min,
-								g.w[w2].h_stage,
-								(M.slabs[w2].row_max -
-								 M.slabs[w2].xfer_min) * 8);
-						if (g.w[0].h_tail)
-							memcpy(got + nrows, g.w[0].h_tail,
-								(ncols - nrows) * 8);
+						bw_gpu_merge_state(&g, got);
 						for (w2 = 0; w2 < ncols; w2++)
 							if (got[w2] != h_xcpu[w2]) {
 								nz = 1;
@@ -566,14 +553,7 @@ static int run_case(msieve_obj *obj, uint32_t nrows, uint32_t ncols,
 			CHECK(j < 26, "full: nilpotent converged (%u)",
 				j);
 			bw_gpu_collect(&g);
-			for (i = 0; i < (uint32_t)g.num_workers; i++)
-				memcpy(deps + M.slabs[i].xfer_min,
-					g.w[i].h_stage,
-					(M.slabs[i].row_max -
-					 M.slabs[i].xfer_min) * 8);
-			if (g.w[0].h_tail)
-				memcpy(deps + nrows, g.w[0].h_tail,
-					(ncols - nrows) * 8);
+			bw_gpu_merge_state(&g, deps);
 			{
 				/* oracle: A*x over cols + dense */
 				uint64_t *y = xcalloc(nrows, 8);
@@ -659,6 +639,8 @@ int main(int argc, char **argv)
 					p++;
 			}
 		}
+		else if (!strcmp(argv[c], "--split=plane"))
+			o.split = 1;
 	}
 
 	obj = msieve_obj_new(NULL, 0, savefile, logfile, NULL,

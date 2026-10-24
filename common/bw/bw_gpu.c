@@ -16,6 +16,15 @@ host memory and barriers.
 
 #include <cuda_runtime.h>
 #include <stdio.h>
+#include <time.h>
+
+/* BW_TIME wall clock, milliseconds */
+static double bw_now_ms(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec / 1e6;
+}
 
 /* single-binary CUDA build: the engine objects are linked in, same
    declaration style as lanczos_matmul_gpu.c */
@@ -48,14 +57,22 @@ static void worker_step_spmv(bw_worker_t *w)
 	uint64_t *xout = w->d_x[g->cur ^ 1];
 	uint32_t i;
 
+	if (g->timing)
+		cudaEventRecord(w->ev_t0, w->compute);
+
 	/* slab 0's sparse CSR starts at num_dense_rows, but its output
 	   range still begins at row 0: the dense kernel accumulates
-	   there, so the whole slab range must be zeroed */
-	CUDA_CHK(w, cudaMemsetAsync(xout + (w->idx == 0 ? 0 :
-						slab->row_min), 0,
-			(size_t)(slab->row_max - (w->idx == 0 ? 0 :
-						slab->row_min)) * 8,
-			w->compute));
+	   there, so the whole slab range must be zeroed. Plane split:
+	   every worker owns the full-range slab, so every worker takes
+	   the slab-0 role */
+	{
+		int lead = (w->idx == 0 || g->plane_split);
+		CUDA_CHK(w, cudaMemsetAsync(xout + (lead ? 0 :
+							slab->row_min), 0,
+				(size_t)(slab->row_max - (lead ? 0 :
+							slab->row_min)) * 8,
+				w->compute));
+	}
 	CUDA_CHK(w, cudaMemsetAsync(xout + M->nrows, 0,
 			(size_t)(g->N - M->nrows) * 8,
 			w->compute));
@@ -67,7 +84,7 @@ static void worker_step_spmv(bw_worker_t *w)
 		spmv_engine_run_on(w->spmv, sd, w->compute);
 	}
 
-	if (w->idx == 0 && M->num_dense_blocks)
+	if ((w->idx == 0 || g->plane_split) && M->num_dense_blocks)
 		bw_dense64(xout, w->d_dense, xin,
 				M->num_dense_blocks, g->N, w->compute);
 }
@@ -88,6 +105,26 @@ static void worker_allgather(bw_worker_t *w, int need_mid_barrier)
 	uint64_t *xout = w->d_x[g->cur ^ 1];
 	int j;
 
+	/* nothing to exchange: plane split keeps every plane resident on
+	   one GPU, and a single worker owns everything. Only the S/flag
+	   copies on the copy stream need completing. Skipping here also
+	   saves the staged path's pointless full-vector D2H that a lone
+	   worker used to do every mksol step */
+	if (g->plane_split || g->num_workers == 1) {
+		if (g->timing) {
+			float ms;
+			double t0 = bw_now_ms();
+			CUDA_CHK(w, cudaStreamSynchronize(w->copy));
+			w->t_copy_sync += bw_now_ms() - t0;
+			w->n_steps++;
+			cudaEventElapsedTime(&ms, w->ev_t0, w->ev_comp);
+			w->t_gpu_compute += ms;
+		}
+		else
+			CUDA_CHK(w, cudaStreamSynchronize(w->copy));
+		return;
+	}
+
 	if (g->use_peer && !need_mid_barrier) {
 		/* pushes ordered by the compute event only */
 		for (j = 0; j < g->num_workers; j++) {
@@ -101,16 +138,41 @@ static void worker_allgather(bw_worker_t *w, int need_mid_barrier)
 					slab->xfer_min) * 8,
 				w->copy));
 		}
-		CUDA_CHK(w, cudaStreamSynchronize(w->copy));
+		if (g->timing) {
+			float ms;
+			double t0 = bw_now_ms();
+			CUDA_CHK(w, cudaStreamSynchronize(w->copy));
+			w->t_copy_sync += bw_now_ms() - t0;
+			w->n_steps++;
+			cudaEventElapsedTime(&ms, w->ev_t0, w->ev_comp);
+			w->t_gpu_compute += ms;
+		}
+		else
+			CUDA_CHK(w, cudaStreamSynchronize(w->copy));
 		return;
 	}
 
 	CUDA_CHK(w, cudaMemcpyAsync(w->h_stage, xout + slab->xfer_min,
 			(size_t)(slab->row_max - slab->xfer_min) * 8,
 			cudaMemcpyDeviceToHost, w->copy));
-	CUDA_CHK(w, cudaStreamSynchronize(w->copy));
+	{
+		double t0 = g->timing ? bw_now_ms() : 0;
+		CUDA_CHK(w, cudaStreamSynchronize(w->copy));
+		if (g->timing) {
+			float ms;
+			w->t_copy_sync += bw_now_ms() - t0;
+			w->n_steps++;
+			cudaEventElapsedTime(&ms, w->ev_t0, w->ev_comp);
+			w->t_gpu_compute += ms;
+		}
+	}
 
-	pthread_barrier_wait(&g->b_mid);
+	{
+		double t0 = g->timing ? bw_now_ms() : 0;
+		pthread_barrier_wait(&g->b_mid);
+		if (g->timing)
+			w->t_bar_mid += bw_now_ms() - t0;
+	}
 
 	for (j = 0; j < g->num_workers; j++) {
 		bw_worker_t *o = g->w + j;
@@ -122,7 +184,12 @@ static void worker_allgather(bw_worker_t *w, int need_mid_barrier)
 				M->slabs[j].xfer_min) * 8,
 			cudaMemcpyHostToDevice, w->copy));
 	}
-	CUDA_CHK(w, cudaStreamSynchronize(w->copy));
+	{
+		double t0 = g->timing ? bw_now_ms() : 0;
+		CUDA_CHK(w, cudaStreamSynchronize(w->copy));
+		if (g->timing)
+			w->t_copy_sync += bw_now_ms() - t0;
+	}
 }
 
 /*-------------------------------------------------------------------*/
@@ -132,6 +199,7 @@ static void worker_do_step(bw_worker_t *w)
 	bw_matrix_t *M = g->M;
 	bw_slab_t *slab = M->slabs + w->idx;
 	uint64_t *xout = w->d_x[g->cur ^ 1];
+	double t0 = g->timing ? bw_now_ms() : 0;
 
 	worker_step_spmv(w);
 
@@ -155,7 +223,7 @@ static void worker_do_step(bw_worker_t *w)
 		   the oprod above misses them. The dense rows are genuine
 		   state and must feed S too: run the oprod over the dense
 		   prefix with the corresponding U words. */
-		if (w->idx == 0 && slab->row_min > 0)
+		if ((w->idx == 0 || g->plane_split) && slab->row_min > 0)
 			bw_oprod64(w->d_s, w->d_u_dense,
 					xout,
 					g->o->m / 64, slab->row_min,
@@ -170,8 +238,12 @@ static void worker_do_step(bw_worker_t *w)
 		CUDA_CHK(w, cudaMemcpyAsync(w->d_fcoef, g->fcoef,
 				g->o->n * 8, cudaMemcpyHostToDevice,
 				w->compute));
-		bw_combine64(xout, w->d_y0, w->d_fcoef, g->N,
-				w->compute);
+		/* plane split: only this worker's planes of the Horner
+		   state are its business; mask the coefficient rows so
+		   the combine never writes foreign planes */
+		bw_combine64(xout, w->d_y0, w->d_fcoef,
+				g->plane_split ? w->plane_mask : ~0ull,
+				g->N, w->compute);
 		CUDA_CHK(w, cudaEventRecord(w->ev_comp, w->compute));
 		/* the allgather reads xout on the copy stream: it must
 		 * wait for the compute stream's SpMV+combine (this was
@@ -207,6 +279,8 @@ static void worker_do_step(bw_worker_t *w)
 		}
 	}
 
+	if (g->timing)
+		w->t_submit += bw_now_ms() - t0;
 	worker_allgather(w, g->cmd == BW_CMD_MKSOL_STEP ||
 				!g->use_peer || g->need_stage);
 }
@@ -276,16 +350,29 @@ static int worker_alloc_and_upload(bw_worker_t *w)
 			(void *)w->h_s);
 	CUDA_CHK(w, cudaHostAlloc((void **)&w->h_stage,
 				slab_words * 8, cudaHostAllocDefault));
-	if (w->idx == 0 && g->N > M->nrows)
+	if ((w->idx == 0 || g->plane_split) && g->N > M->nrows)
 		CUDA_CHK(w, cudaHostAlloc((void **)&w->h_tail,
 				(size_t)(g->N - M->nrows) * 8,
 				cudaHostAllocDefault));
 
-	/* Y0 and the initial state */
+	/* Y0 and the initial state. Y0 stays full on every GPU (the
+	   mksol combine reads all its planes); the running state carries
+	   only this worker's planes in split mode */
 	CUDA_CHK(w, cudaMemcpy(w->d_y0, g->h_y0,
 			(size_t)g->N * 8, cudaMemcpyHostToDevice));
-	CUDA_CHK(w, cudaMemcpy(w->d_x[g->cur], g->h_y0,
-			(size_t)g->N * 8, cudaMemcpyHostToDevice));
+	if (g->plane_split && w->plane_mask != ~0ull) {
+		uint64_t *tmp = (uint64_t *)xmalloc((size_t)g->N * 8);
+		uint64_t i2;
+		for (i2 = 0; i2 < g->N; i2++)
+			tmp[i2] = g->h_y0[i2] & w->plane_mask;
+		CUDA_CHK(w, cudaMemcpy(w->d_x[g->cur], tmp,
+				(size_t)g->N * 8, cudaMemcpyHostToDevice));
+		free(tmp);
+	}
+	else {
+		CUDA_CHK(w, cudaMemcpy(w->d_x[g->cur], g->h_y0,
+				(size_t)g->N * 8, cudaMemcpyHostToDevice));
+	}
 	CUDA_CHK(w, cudaMemcpy(w->d_u,
 			g->h_u + (size_t)slab->row_min * words_per_row,
 			(size_t)(slab->row_max - slab->row_min) *
@@ -322,6 +409,8 @@ static void worker_free(bw_worker_t *w)
 		cudaEventDestroy(w->ev_comp);
 	if (w->ev_comb)
 		cudaEventDestroy(w->ev_comb);
+	if (w->ev_t0)
+		cudaEventDestroy(w->ev_t0);
 	for (i = 0; i < w->num_sd; i++) {
 		if (w->sd[i].row_entries)
 			cudaFree((void *)(uintptr_t)w->sd[i].row_entries);
@@ -356,6 +445,8 @@ static void *worker_main(void *arg)
 	CUDA_CHK(w, cudaStreamCreate(&w->copy));
 	CUDA_CHK(w, cudaEventCreate(&w->ev_comp));
 	CUDA_CHK(w, cudaEventCreate(&w->ev_comb));
+	if (g->timing)
+		CUDA_CHK(w, cudaEventCreate(&w->ev_t0));
 	w->spmv = spmv_engine_init(NULL);
 
 	/* peer probe and (best-effort) enable */
@@ -377,8 +468,12 @@ static void *worker_main(void *arg)
 
 	while (1) {
 		int stop;
+		double tb;
 
+		tb = g->timing ? bw_now_ms() : 0;
 		pthread_barrier_wait(&g->b_start);
+		if (g->timing)
+			w->t_bar_start += bw_now_ms() - tb;
 
 		stop = (g->cmd == BW_CMD_STOP);
 
@@ -408,9 +503,22 @@ static void *worker_main(void *arg)
 			break;
 
 		case BW_CMD_UPLOAD_X:
-			CUDA_CHK(w, cudaMemcpy(w->d_x[g->cur], g->h_x,
-					(size_t)g->N * 8,
-					cudaMemcpyHostToDevice));
+			if (g->plane_split && w->plane_mask != ~0ull) {
+				uint64_t *tmp = (uint64_t *)xmalloc(
+							(size_t)g->N * 8);
+				uint64_t i2;
+				for (i2 = 0; i2 < g->N; i2++)
+					tmp[i2] = g->h_x[i2] & w->plane_mask;
+				CUDA_CHK(w, cudaMemcpy(w->d_x[g->cur],
+						tmp, (size_t)g->N * 8,
+						cudaMemcpyHostToDevice));
+				free(tmp);
+			}
+			else {
+				CUDA_CHK(w, cudaMemcpy(w->d_x[g->cur],
+						g->h_x, (size_t)g->N * 8,
+						cudaMemcpyHostToDevice));
+			}
 			break;
 
 		case BW_CMD_KRYLOV_STEP:
@@ -427,7 +535,7 @@ static void *worker_main(void *arg)
 					(size_t)(slab->row_max -
 						slab->xfer_min) * 8,
 					cudaMemcpyDeviceToHost));
-				if (w->idx == 0 && w->h_tail)
+				if (w->h_tail)
 					CUDA_CHK(w, cudaMemcpy(w->h_tail,
 						w->d_x[g->cur] +
 							g->M->nrows,
@@ -442,7 +550,10 @@ static void *worker_main(void *arg)
 		}
 
 end_of_step:
+		tb = g->timing ? bw_now_ms() : 0;
 		pthread_barrier_wait(&g->b_end);
+		if (g->timing)
+			w->t_bar_end += bw_now_ms() - tb;
 		if (stop)
 			break;
 	}
@@ -459,6 +570,8 @@ int bw_gpu_start(bw_group_t *g, bw_matrix_t *M, const bw_opts_t *o,
 	bw_matrix_t *Mx = M;
 
 	memset(g, 0, sizeof(bw_group_t));
+	g->timing = (getenv("BW_TIME") != NULL);
+	g->plane_split = (o->split != 0 && o->num_gpus > 1);
 	g->M = Mx;
 	g->o = o;
 	g->N = Mx->ncols;
@@ -480,6 +593,22 @@ int bw_gpu_start(bw_group_t *g, bw_matrix_t *M, const bw_opts_t *o,
 		g->w[i].idx = i;
 		g->w[i].dev = o->gpus[i];
 		g->w[i].g = g;
+		if (g->plane_split) {
+			g->w[i].plane_lo = (64 * i) / g->num_workers;
+			g->w[i].plane_hi = (64 * (i + 1)) /
+						g->num_workers;
+		}
+		else {
+			g->w[i].plane_lo = 0;
+			g->w[i].plane_hi = 64;
+		}
+		g->w[i].plane_mask = (g->w[i].plane_hi > g->w[i].plane_lo)
+			? ((g->w[i].plane_hi - g->w[i].plane_lo == 64)
+				? ~0ull
+				: (((1ull << (g->w[i].plane_hi -
+					g->w[i].plane_lo)) - 1) <<
+					g->w[i].plane_lo))
+			: 0ull;
 	}
 
 	pthread_barrier_init(&g->b_start, NULL, g->num_workers + 1);
@@ -532,4 +661,59 @@ void bw_gpu_stop(bw_group_t *g) {
 	pthread_barrier_destroy(&g->b_end);
 	free(g->w);
 	g->w = NULL;
+}
+
+/*-------------------------------------------------------------------*/
+/* BW_TIME summary. Call with the workers parked at b_start (between
+   driver phases); prints per-worker phase averages and the per-step
+   exchange volumes implied by the slab geometry. */
+void bw_gpu_time_report(bw_group_t *g, msieve_obj *obj, const char *phase)
+{
+	int i, j;
+
+	if (!g->timing)
+		return;
+	logprintf(obj, "BW time [%s]: %d workers\n", phase,
+			g->num_workers);
+	for (i = 0; i < g->num_workers; i++) {
+		bw_worker_t *w = g->w + i;
+		uint64_t n = w->n_steps ? w->n_steps : 1;
+		uint64_t out_b = 0, in_b = 0;
+		if (!g->plane_split && g->num_workers > 1) {
+			for (j = 0; j < g->num_workers; j++) {
+				bw_slab_t *s = g->M->slabs + j;
+				uint64_t bytes = (uint64_t)(s->row_max -
+						s->xfer_min) * 8;
+				if (j == i)
+					out_b += bytes;
+				else
+					in_b += bytes;
+			}
+			out_b *= (g->num_workers - 1);
+		}
+		logprintf(obj, "  w%d(gpu%d): %llu steps | "
+			"submit %.3f sync %.3f barmid %.3f barend %.3f "
+			"barstart %.3f | gpu_compute %.3f ms/step | "
+			"xfer %.1f out + %.1f in MB/step\n",
+			i, w->dev, (unsigned long long)w->n_steps,
+			w->t_submit / n, w->t_copy_sync / n,
+			w->t_bar_mid / n, w->t_bar_end / n,
+			w->t_bar_start / n, w->t_gpu_compute / n,
+			(double)out_b / 1e6,
+			(double)in_b / 1e6);
+	}
+}
+
+void bw_gpu_time_reset(bw_group_t *g)
+{
+	int i;
+
+	if (!g->timing)
+		return;
+	for (i = 0; i < g->num_workers; i++) {
+		bw_worker_t *w = g->w + i;
+		w->t_submit = w->t_copy_sync = w->t_bar_mid = 0;
+		w->t_bar_end = w->t_bar_start = w->t_gpu_compute = 0;
+		w->n_steps = 0;
+	}
 }

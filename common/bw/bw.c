@@ -165,6 +165,14 @@ static int bw_opt_one(bw_opts_t *o, const char *key, const char *val,
 			return -1;
 		}
 	}
+	else if (!strcmp(key, "bw_split")) {
+		if (!strcmp(val, "rows")) o->split = 0;
+		else if (!strcmp(val, "plane")) o->split = 1;
+		else {
+			logprintf(obj, "error: bw_split must be rows|plane\n");
+			return -1;
+		}
+	}
 	else if (!strcmp(key, "bw_lingen_threshold")) {
 		if (parse_uint(val, &v) || v < 16 || v > 65536) {
 			logprintf(obj, "error: bw_lingen_threshold out of "
@@ -287,6 +295,13 @@ int bw_opts_parse(bw_opts_t *o, msieve_obj *obj, const char *args) {
 			if (bw_scan(o, tok, obj))
 				return -1;
 		}
+		e = getenv("MSIEVE_BW_SPLIT");
+		if (e && *e) {
+			char tok[64];
+			snprintf(tok, sizeof(tok), "bw_split=%s", e);
+			if (bw_scan(o, tok, obj))
+				return -1;
+		}
 	}
 
 	if (o->enabled && o->num_gpus < 1)
@@ -402,7 +417,9 @@ uint64_t *bw_solve(msieve_obj *obj,
 	logprintf(obj, "BW: m=%u n=%u gpus=", o.m, o.n);
 	for (i = 0; i < o.num_gpus; i++)
 		logprintf(obj, "%s%d", i ? "," : "", o.gpus[i]);
-	logprintf(obj, ", N=%u, L=%u (interval %u)\n", N, L, interval);
+	logprintf(obj, ", N=%u, L=%u (interval %u), split %s\n", N, L,
+			interval, (o.split && o.num_gpus > 1) ? "plane" :
+			"rows");
 
 	/* Y0: N words random (nonzero tail included) */
 	h_y0 = (uint64_t *)xmalloc((size_t)N * sizeof(uint64_t));
@@ -470,11 +487,20 @@ uint64_t *bw_solve(msieve_obj *obj,
 		remove(chk_path);
 	}
 
-	/* matrix packaging (slabs in GPU list order) */
+	/* matrix packaging (slabs in GPU list order). Plane split: pack
+	   once and give every GPU the full matrix; the state's bit planes
+	   are partitioned across workers instead of rows, so no per-step
+	   exchange is needed (see bw_gpu.c) */
 	if (bw_matrix_build(&M, obj, nrows, num_dense_rows, ncols, cols,
-			o.num_gpus, o.block_nnz, o.gpus[0])) {
+			(o.split && o.num_gpus > 1) ? 1 : o.num_gpus,
+			o.block_nnz, o.gpus[0])) {
 		logprintf(obj, "error: BW matrix packaging failed\n");
 		goto fail;
+	}
+	if (o.split && o.num_gpus > 1 &&
+			bw_matrix_replicate_slabs(&M, o.num_gpus)) {
+		logprintf(obj, "error: BW plane-split replication failed\n");
+		goto fail_after_matrix;
 	}
 
 	memset(&g, 0, sizeof(bw_group_t));

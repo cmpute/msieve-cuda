@@ -90,20 +90,19 @@ extern "C" void bw_oprod64(ull_t *s, const ull_t *u,
 }
 
 /*--------------------------------------------------------------------
-bw_combine64: x[i] ^= Y0[i] * F (64x64 GF(2) map, row-major words).
-
-F sits in constant-like shared memory; per word the work is the
-weight of Y0[i] (32 XORs on average).
+bw_combine64: x[i] ^= Y0[i] * F (64x64 GF(2) map, row-major words),
+restricted to the bit-planes set in mask (plane-split mode keeps
+each GPU's share of the Horner state disjoint).
 --------------------------------------------------------------------*/
 __global__ void bw_combine64_kernel(ull_t *x, const ull_t *y0,
-			const ull_t *fw, size_t n)
+			const ull_t *fw, ull_t mask, size_t n)
 {
 	__shared__ ull_t sh[64];
 	uint32_t tid = threadIdx.x;
 	size_t i;
 
 	if (tid < 64)
-		sh[tid] = fw[tid];
+		sh[tid] = fw[tid] & mask;
 	__syncthreads();
 
 	for (i = (size_t)blockIdx.x * blockDim.x + tid; i < n;
@@ -120,13 +119,14 @@ __global__ void bw_combine64_kernel(ull_t *x, const ull_t *y0,
 }
 
 extern "C" void bw_combine64(ull_t *x, const ull_t *y0,
-			const ull_t *fw, size_t n, cudaStream_t stream)
+			const ull_t *fw, ull_t mask, size_t n,
+			cudaStream_t stream)
 {
 	int blocks = (int)((n + BW_THREADS - 1) / BW_THREADS);
 	if (blocks > 8192)
 		blocks = 8192;
 	bw_combine64_kernel<<<blocks, BW_THREADS, 0, stream>>>
-			(x, y0, fw, n);
+			(x, y0, fw, mask, n);
 }
 
 /*--------------------------------------------------------------------
