@@ -38,6 +38,25 @@ int bw_lingen_quad_full(const char *afile, const char *ffile,
 			uint32_t nrows, uint32_t ncols, int dev,
 			uint32_t luck_mini, uint32_t nthreads);
 
+/* the independent recursive lingen (bw_lingen_own.cpp) */
+int bw_lingen_own_full(const char *afile, const char *ffile,
+		uint32_t m, uint32_t n, uint64_t seq_len, uint32_t nrows,
+		uint32_t ncols, int dev, uint32_t nthreads,
+		uint32_t threshold);
+
+/* shared pieces used by bw_lingen_own.cpp */
+int bwq_select(const uint64_t *A, uint32_t mrows, uint32_t count,
+		uint32_t n, uint64_t L, uint32_t *kk, uint32_t *jj);
+int bwq_basecase(const uint64_t *E_rows, uint64_t host_stride,
+		uint32_t b, uint32_t m, uint32_t L, uint32_t ncoeff,
+		int dev, const uint32_t *gamma_in, uint32_t *gamma_out,
+		uint64_t *F_out);
+int bwq_emit(const uint64_t *Fh, uint64_t rowcapF, uint32_t b,
+		uint32_t m, uint32_t n, uint32_t maug, int t0,
+		const uint32_t *kk, const uint32_t *jj, const int *lucky,
+		uint64_t ncoeff, uint32_t luck_mini, const char *ffile,
+		uint32_t nrows, uint32_t ncols);
+
 #ifdef __cplusplus
 }
 #endif

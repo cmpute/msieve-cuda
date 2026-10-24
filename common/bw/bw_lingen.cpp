@@ -65,6 +65,19 @@ int bw_lingen_run(const bw_lingen_opts_t *o)
 	bw_lingen_quad_flag = (g_bw_lingen_impl == 1);
 	bw_lingen_quad_dev = (int)g_bw_lingen_dev;
 
+	/* the own track: independent recursive lingen (no CADO code) */
+	if (g_bw_lingen_impl == 2) {
+		if (bw_lingen_own_full(o->afile, o->ffile, o->m, o->n,
+					o->seq_len, o->nrows, o->ncols,
+					(int)g_bw_lingen_dev, o->nthreads,
+					o->threshold)) {
+			fprintf(stderr, "BW own: full lingen failed\n");
+			return -1;
+		}
+		fprintf(stderr, "BW lingen: F written to %s\n", o->ffile);
+		return 0;
+	}
+
 	/* the quad track is fully self-contained: no CADO machinery */
 	if (bw_lingen_quad_flag) {
 		if (bw_lingen_quad_full(o->afile, o->ffile, o->m, o->n,

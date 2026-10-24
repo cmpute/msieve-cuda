@@ -198,7 +198,8 @@ static int bw_opt_one(bw_opts_t *o, const char *key, const char *val,
 	else if (!strcmp(key, "bw_lingen_impl")) {
 		/* stored globally; bw_lingen_run picks it up */
 		extern uint32_t g_bw_lingen_impl;
-		g_bw_lingen_impl = !strcmp(val, "quad");
+		g_bw_lingen_impl = !strcmp(val, "quad") ? 1 :
+				!strcmp(val, "own") ? 2 : 0;
 	}
 	else {
 		logprintf(obj, "error: unknown BW option '%s'\n", key);

@@ -52,9 +52,9 @@ static double bwq_now(void)
 Selection: m independent columns of A, earliest coefficients first.
 Returns t0 = max k_r, or -1 (as int) on failure.
 --------------------------------------------------------------------*/
-static int quad_select(const uint64_t *A, uint32_t mrows, uint32_t count,
-			uint32_t n, uint64_t L, std::vector<uint32_t> &kk,
-			std::vector<uint32_t> &jj)
+extern "C" {
+int bwq_select(const uint64_t *A, uint32_t mrows, uint32_t count,
+		uint32_t n, uint64_t L, uint32_t *kk, uint32_t *jj)
 {
 	const uint32_t nw = (mrows + 63) / 64;
 	std::vector<uint64_t> basis((size_t)count * nw, 0);
@@ -116,8 +116,9 @@ The GPU BM core: P0 is the augmented transposed sequence (b rows,
 mb words per coefficient, L coefficients, arena layout). On return
 Fh holds the generator rows, lucky[] the streaks, hi[] the row lengths.
 --------------------------------------------------------------------*/
-static int quad_bm(const std::vector<uint64_t> &P0, uint32_t b,
+static int quad_bm(const uint64_t *P0, uint32_t b,
 		uint32_t m, uint32_t L, uint32_t ncoeff, int dev,
+		const uint32_t *gamma_init,
 		std::vector<uint64_t> &Fh, std::vector<int> &lucky,
 		std::vector<uint32_t> &hi, std::vector<uint32_t> &gamma)
 {
@@ -155,11 +156,14 @@ static int quad_bm(const std::vector<uint64_t> &P0, uint32_t b,
 	for (uint32_t r = 0; r < b; r++)
 		F0[(size_t)r * rowcapF + (r >> 6)] = 1ull << (r & 63);
 	if (bwq_upload(F0.data(), dF, (uint64_t)b * rowcapF * 8, stream) ||
-	    bwq_upload(P0.data(), dP, (uint64_t)b * rowcapP * 8, stream))
+	    bwq_upload(P0, dP, (uint64_t)b * rowcapP * 8, stream))
 		return -1;
 
 	lucky.assign(b, 0);
 	gamma.assign(b, 0);
+	if (gamma_init)
+		for (uint32_t r = 0; r < b; r++)
+			gamma[r] = gamma_init[r];
 	hi.assign(b, 1);
 	std::vector<uint64_t> h_delta((size_t)b * mb);
 	std::vector<uint8_t> used(b);
@@ -305,96 +309,22 @@ static int quad_bm(const std::vector<uint64_t> &P0, uint32_t b,
 }
 
 /*--------------------------------------------------------------------
-Full pipeline: A file -> F file.
+Candidate selection + W extraction + F-file emission, shared by the
+standalone quad pipeline and the independent recursive lingen
+(bw_lingen_own.cpp). Fh rows are the generator arena (b rows, rowcapF
+stride). luck_mini=1 with all-equal lucky[] selects purely by
+independence (every row of a recursive pi annihilates the window).
 --------------------------------------------------------------------*/
-int bw_lingen_quad_full(const char *afile, const char *ffile,
-			uint32_t m, uint32_t n, uint64_t seq_len,
-			uint32_t nrows, uint32_t ncols, int dev,
-			uint32_t luck_mini, uint32_t nthreads)
+int bwq_emit(const uint64_t *Fh, uint64_t rowcapF, uint32_t b, uint32_t m,
+		uint32_t n, uint32_t maug, int t0, const uint32_t *kk,
+		const uint32_t *jj, const int *lucky, uint64_t ncoeff,
+		uint32_t luck_mini, const char *ffile, uint32_t nrows,
+		uint32_t ncols)
 {
-	(void)nthreads;
-	/* ingest the A file */
-	FILE *f = fopen(afile, "rb");
-	if (!f) {
-		fprintf(stderr, "BW quad: cannot open %s\n", afile);
-		return -1;
-	}
-	bw_filehdr_t hdr;
-	if (fread(&hdr, 1, 64, f) != 64 || hdr.magic != BW_A_MAGIC ||
-			hdr.m != m || hdr.n != n) {
-		fprintf(stderr, "BW quad: bad A header\n");
-		fclose(f);
-		return -1;
-	}
-	const uint64_t L = hdr.seq_len ? hdr.seq_len : seq_len;
-	std::vector<uint64_t> A((size_t)L * m);
-	if (fread(A.data(), 8, (size_t)L * m, f) != (size_t)L * m) {
-		fprintf(stderr, "BW quad: A truncated\n");
-		fclose(f);
-		return -1;
-	}
-	fclose(f);
-
-	/* augmentation selection */
-	const uint32_t maug = m;
-	std::vector<uint32_t> kk(maug), jj(maug);
-	int t0 = quad_select(A.data(), m, maug, n, L, kk, jj);
-	if (t0 < 0) {
-		fprintf(stderr, "BW quad: selection failed\n");
-		return -1;
-	}
-	fprintf(stderr, "BW quad: t0=%d\n", t0);
-	const uint32_t b = n + maug;
 	const uint32_t bb = (b + 63) / 64;
 	const uint32_t nw = (n + 63) / 64;
-	const uint32_t mb = (m + 63) / 64;
-	/* E' in coefficient-window form: identity columns shifted by
-	 * t0, augmentation columns by kk; BM annihilates this window.
-	 * The P arena must hold the window plus each row's shifts:
-	 * balanced pivoting puts the mean shift count at L*m/b, but the
-	 * per-row spread is a random walk -- observed +1790 (+9*b) over
-	 * the mean at L=9469, so size for a quarter-window overshoot. */
-	const uint64_t LE = L - (uint64_t)t0;
-	const uint64_t ncoeff = LE + LE * m / b + LE / 4 + 4 * b + 1024;
-	const uint64_t rowcapP = ncoeff * mb;
-	const uint64_t rowcapF = ncoeff * bb;
-
-	/* build P0 = E''^T (see the layout note above) */
-	std::vector<uint64_t> P0((size_t)b * rowcapP, 0);
-	for (uint64_t c = 0; c < LE; c++) {
-		for (uint32_t r = 0; r < n; r++) {
-			const uint64_t *Ak = A.data() + (c + (uint64_t)t0) * m;
-			uint64_t *dst = &P0[(size_t)r * rowcapP +
-						(uint64_t)c * mb];
-			for (uint32_t i = 0; i < m; i++)
-				if ((Ak[i] >> r) & 1)
-					dst[i >> 6] |= 1ull << (i & 63);
-		}
-		for (uint32_t r = 0; r < maug; r++) {
-			const uint64_t *Ak = A.data() +
-					(c + (uint64_t)kk[r]) * m;
-			uint64_t *dst = &P0[(size_t)(n + r) * rowcapP +
-						(uint64_t)c * mb];
-			for (uint32_t i = 0; i < m; i++)
-				if ((Ak[i] >> jj[r]) & 1)
-					dst[i >> 6] |= 1ull << (i & 63);
-		}
-	}
-
-
-
-	/* run the BM */
-	std::vector<uint64_t> Fh;
-	std::vector<int> lucky;
-	std::vector<uint32_t> hi, gamma;
-	if (quad_bm(P0, b, m, (uint32_t)LE, (uint32_t)ncoeff, dev,
-			Fh, lucky, hi, gamma)) {
-		fprintf(stderr, "BW quad: BM failed\n");
-		return -1;
-	}
-
-
-
+	FILE *f;
+	bw_filehdr_t hdr;
 
 	/* pick n solution rows: streak-qualified, W-independent, W != 0.
 	 * (Trivial relations between duplicated augmented columns reach the
@@ -402,6 +332,42 @@ int bw_lingen_quad_full(const char *afile, const char *ffile,
 	 * the n-bit polynomial vectors is the real selector.) */
 	std::vector<uint32_t> cand;
 	{
+		if (getenv("BWQ_DBG")) {
+			/* per-row W zero-ness probe */
+			uint32_t nz = 0;
+			for (uint32_t r = 0; r < b; r++) {
+				int any = 0;
+				for (uint64_t c = 0; c < ncoeff && !any; c++) {
+					uint64_t Wv = 0;
+					const uint64_t *Fr = &Fh[(size_t)r * rowcapF];
+					for (uint32_t wq = 0; wq < bb; wq++) {
+						uint64_t fw = Fr[c * bb + wq];
+						while (fw) {
+							uint32_t rr2 = wq * 64 +
+								__builtin_ctzll(fw);
+							if (rr2 < n)
+								Wv |= 1ull << rr2;
+							fw &= fw - 1;
+						}
+					}
+					for (uint32_t rp = 0; rp < maug; rp++) {
+						int64_t cc = (int64_t)c - t0 +
+							(int64_t)kk[rp];
+						if (cc < 0 || (uint64_t)cc >= ncoeff)
+							continue;
+						uint32_t bit = n + rp;
+						if ((Fr[(uint64_t)cc * bb +
+							(bit >> 6)] >> (bit & 63)) & 1)
+							Wv ^= 1ull << jj[rp];
+					}
+					if (Wv)
+						any = 1;
+				}
+				nz += any;
+			}
+			fprintf(stderr, "BWQ_DBG emit: %u/%u rows have "
+				"W != 0\n", nz, b);
+		}
 		std::vector<uint32_t> idx(b);
 		for (uint32_t r = 0; r < b; r++) idx[r] = r;
 		std::stable_sort(idx.begin(), idx.end(),
@@ -629,4 +595,136 @@ int bw_lingen_quad_full(const char *afile, const char *ffile,
 	}
 	fclose(f);
 	return 0;
+}
+
+/*--------------------------------------------------------------------
+GPU basecase for external callers (the recursive lingen): packs the
+caller's compact E rows (host_stride words per row, L coefficients of
+mb words) into the zero-padded arena stride and runs the engine.
+F_out must hold b*ncoeff*bb words.
+--------------------------------------------------------------------*/
+int bwq_basecase(const uint64_t *E_rows, uint64_t host_stride, uint32_t b,
+		uint32_t m, uint32_t L, uint32_t ncoeff, int dev,
+		const uint32_t *gamma_in, uint32_t *gamma_out,
+		uint64_t *F_out)
+{
+	const uint32_t mb = (m + 63) / 64;
+	const uint32_t bb = (b + 63) / 64;
+	const uint64_t rowcapP = (uint64_t)ncoeff * mb;
+	const uint64_t rowcapF = (uint64_t)ncoeff * bb;
+	std::vector<uint64_t> P0((size_t)b * rowcapP, 0);
+	for (uint32_t r = 0; r < b; r++)
+		memcpy(&P0[(size_t)r * rowcapP],
+			E_rows + (size_t)r * host_stride,
+			(size_t)L * mb * 8);
+	std::vector<uint64_t> Fh;
+	std::vector<int> lucky;
+	std::vector<uint32_t> hi, gamma;
+	if (quad_bm(P0.data(), b, m, L, ncoeff, dev, gamma_in, Fh, lucky,
+			hi, gamma))
+		return -1;
+	memcpy(F_out, Fh.data(), (size_t)b * rowcapF * 8);
+	if (gamma_out)
+		for (uint32_t r = 0; r < b; r++)
+			gamma_out[r] = gamma[r];
+	return 0;
+}
+
+}
+ /* extern "C" */
+
+/*--------------------------------------------------------------------
+Full pipeline: A file -> F file.
+--------------------------------------------------------------------*/
+int bw_lingen_quad_full(const char *afile, const char *ffile,
+			uint32_t m, uint32_t n, uint64_t seq_len,
+			uint32_t nrows, uint32_t ncols, int dev,
+			uint32_t luck_mini, uint32_t nthreads)
+{
+	(void)nthreads;
+	/* ingest the A file */
+	FILE *f = fopen(afile, "rb");
+	if (!f) {
+		fprintf(stderr, "BW quad: cannot open %s\n", afile);
+		return -1;
+	}
+	bw_filehdr_t hdr;
+	if (fread(&hdr, 1, 64, f) != 64 || hdr.magic != BW_A_MAGIC ||
+			hdr.m != m || hdr.n != n) {
+		fprintf(stderr, "BW quad: bad A header\n");
+		fclose(f);
+		return -1;
+	}
+	const uint64_t L = hdr.seq_len ? hdr.seq_len : seq_len;
+	std::vector<uint64_t> A((size_t)L * m);
+	if (fread(A.data(), 8, (size_t)L * m, f) != (size_t)L * m) {
+		fprintf(stderr, "BW quad: A truncated\n");
+		fclose(f);
+		return -1;
+	}
+	fclose(f);
+
+	/* augmentation selection */
+	const uint32_t maug = m;
+	std::vector<uint32_t> kk(maug), jj(maug);
+	int t0 = bwq_select(A.data(), m, maug, n, L, kk.data(), jj.data());
+	if (t0 < 0) {
+		fprintf(stderr, "BW quad: selection failed\n");
+		return -1;
+	}
+	fprintf(stderr, "BW quad: t0=%d\n", t0);
+	const uint32_t b = n + maug;
+	const uint32_t bb = (b + 63) / 64;
+	const uint32_t nw = (n + 63) / 64;
+	const uint32_t mb = (m + 63) / 64;
+	/* E' in coefficient-window form: identity columns shifted by
+	 * t0, augmentation columns by kk; BM annihilates this window.
+	 * The P arena must hold the window plus each row's shifts:
+	 * balanced pivoting puts the mean shift count at L*m/b, but the
+	 * per-row spread is a random walk -- observed +1790 (+9*b) over
+	 * the mean at L=9469, so size for a quarter-window overshoot. */
+	const uint64_t LE = L - (uint64_t)t0;
+	const uint64_t ncoeff = LE + LE * m / b + LE / 4 + 4 * b + 1024;
+	const uint64_t rowcapP = ncoeff * mb;
+	const uint64_t rowcapF = ncoeff * bb;
+
+	/* build P0 = E''^T (see the layout note above) */
+	std::vector<uint64_t> P0((size_t)b * rowcapP, 0);
+	for (uint64_t c = 0; c < LE; c++) {
+		for (uint32_t r = 0; r < n; r++) {
+			const uint64_t *Ak = A.data() + (c + (uint64_t)t0) * m;
+			uint64_t *dst = &P0[(size_t)r * rowcapP +
+						(uint64_t)c * mb];
+			for (uint32_t i = 0; i < m; i++)
+				if ((Ak[i] >> r) & 1)
+					dst[i >> 6] |= 1ull << (i & 63);
+		}
+		for (uint32_t r = 0; r < maug; r++) {
+			const uint64_t *Ak = A.data() +
+					(c + (uint64_t)kk[r]) * m;
+			uint64_t *dst = &P0[(size_t)(n + r) * rowcapP +
+						(uint64_t)c * mb];
+			for (uint32_t i = 0; i < m; i++)
+				if ((Ak[i] >> jj[r]) & 1)
+					dst[i >> 6] |= 1ull << (i & 63);
+		}
+	}
+
+
+
+	/* run the BM */
+	std::vector<uint64_t> Fh;
+	std::vector<int> lucky;
+	std::vector<uint32_t> hi, gamma;
+	if (quad_bm(P0.data(), b, m, (uint32_t)LE, (uint32_t)ncoeff, dev,
+			NULL, Fh, lucky, hi, gamma)) {
+		fprintf(stderr, "BW quad: BM failed\n");
+		return -1;
+	}
+
+
+
+	return bwq_emit(Fh.data(), rowcapF, b, m, n, maug, t0,
+			kk.data(), jj.data(), lucky.data(), ncoeff,
+			luck_mini, ffile, nrows, ncols);
 }

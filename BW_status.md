@@ -113,6 +113,54 @@ past the theoretical completion point).
 F degree 6236 on the real matrix (theory 2N/m = 6239); quad BM
 ~5-10 ms/step at m=128/b=192, GPU resident.
 
+## Independent recursive lingen (bw_lingen_impl=own) — working
+
+2026-10-24, evening. Fully independent lingen: no CADO/gf2x code
+whatsoever (user decision; the GPU-leaf fusion into the vendored
+recursion was built and then reverted for the same reason).
+
+Pieces (all public domain):
+- bw_gfpoly.c/.h: GF(2)[x] Karatsuba over bit-packed words,
+  word-aligned splits, chunked handling of unbalanced operands.
+  Validated against a reference schoolbook (4000 random <=500x500
+  under ASAN, exhaustive 10..120, 3000 each at several large/unbalanced
+  sizes). Three real bugs found on the way, worth remembering:
+  mul_word must not early-return on the k=0 bit; the Karatsuba cross
+  term needs z2 in its RAW (unshifted) frame; unbalanced splits must
+  accumulate the high product into a zeroed tail (gpmul is
+  write-only).
+- bw_lingen_own.cpp: recursive block BM, own invariants (basecase
+  = the quad GPU engine via bwq_basecase; pi = piL * piR with the
+  middle-product window [half, L) of E*piL). The scalar-vector
+  products decompose per BIT plane (a word-level "plane" loses the
+  bit independence of scalar x vector multiplication).
+- Delta threading through the recursion is REQUIRED, not an
+  optimization: without it every column churns to max degree in every
+  sub-window, and the composed W junk bound (t0 + degree) crosses the
+  declared file degree. With it, early-frozen columns stay small
+  (test F degree 7 vs quad's 8 vs cado's 6).
+- The quad engine got exported glue: bwq_select / bwq_basecase
+  (gamma_in/out) / bwq_emit, all inside extern "C" in
+  bw_lingen_quad.h.
+
+Status: identity tests (m=64/128), BW_TEST_FULL closed loop, and the
+RSA-100 e2e all pass. Timings on the RSA-100 matrix (3 GPUs):
+cado 69 s / quad 68 s / own 93 s (lingen only; Krylov 6 s, mksol 3 s).
+F degree 6354 (theory 2N/m = 6239). RSA-100 factors recovered from
+its single CPU-verified dependency (dep bit-plane 43).
+
+Known weakness: the own route currently yields only 1 nilpotent-verified
+dependency (cado 64, quad 47) — the smallest-degree-first selection
+picks W-independent but kernel-correlated rows. Fine for factoring
+(needs 1), worth improving before production use.
+
+Build-mode trap (bit us twice): plain `make` (BW=0) recompiles
+gf2.o without HAVE_BW; a later `make BW=1 ...` only relinks, so msieve
+silently loses the BW dispatch and runs Block Lanczos. Touch
+gnfs/gf2.c (the only HAVE_BW-dependent TU) when switching back.
+Also `make msieve` is a no-op (msieve is not a real target; the
+default goal builds it).
+
 ## Open (next session)
 
 - multi-GPU scaling table on this matrix (1 vs 2 vs 3 GPUs).

@@ -152,6 +152,10 @@ int main(int argc, char **argv)
 			g_bw_lingen_impl = 1;
 			g_bw_lingen_dev = 1;
 		}
+		if (getenv("OWNL")) {
+			g_bw_lingen_impl = 2;
+			g_bw_lingen_dev = 1;
+		}
 		if (bw_lingen_run(&o)) {
 			printf("LINGEN TEST FAIL: bw_lingen_run errored\n");
 			return 1;

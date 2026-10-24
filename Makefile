@@ -310,7 +310,8 @@ BW_C_SRCS = \
 
 BW_OBJS = $(BW_C_SRCS:.c=.bwo)
 BW_KERNEL_OBJ = common/bw/bw_kernel.o
-BW_LINGEN_OBJ = common/bw/bw_lingen.bwx
+BW_LINGEN_OBJ = common/bw/bw_lingen.bwx common/bw/bw_lingen_own.bwx \
+		common/bw/bw_gfpoly.bwo
 BW_QUAD_OBJ = common/bw/bw_lingen_quad.bwx common/bw/bw_lingen_quad_kernel.o
 
 ifeq ($(BW),1)
@@ -412,6 +413,13 @@ $(BW_OBJS): %.bwo: %.c $(COMMON_HDR) common/bw/bw.h common/bw/bw_gpu.h \
 
 common/bw/bw_lingen.bwx: common/bw/bw_lingen.cpp
 	$(CXX) $(BW_CXXFLAGS) -c -o $@ $<
+
+common/bw/bw_lingen_own.bwx: common/bw/bw_lingen_own.cpp \
+		common/bw/bw_lingen_quad.h common/bw/bw_gfpoly.h
+	$(CXX) $(BW_CXXFLAGS) -c -o $@ $<
+
+common/bw/bw_gfpoly.bwo: common/bw/bw_gfpoly.c common/bw/bw_gfpoly.h
+	$(CC) $(CFLAGS) -c -o $@ $<
 
 common/bw/bw_lingen_quad.bwx: common/bw/bw_lingen_quad.cpp
 	$(CXX) $(BW_CXXFLAGS) -c -o $@ $<
