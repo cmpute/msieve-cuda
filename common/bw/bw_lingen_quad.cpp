@@ -52,23 +52,23 @@ static double bwq_now(void)
 Selection: m independent columns of A, earliest coefficients first.
 Returns t0 = max k_r, or -1 (as int) on failure.
 --------------------------------------------------------------------*/
-static int quad_select(const uint64_t *A, uint32_t m, uint32_t n,
-			uint64_t L, std::vector<uint32_t> &kk,
+static int quad_select(const uint64_t *A, uint32_t mrows, uint32_t count,
+			uint32_t n, uint64_t L, std::vector<uint32_t> &kk,
 			std::vector<uint32_t> &jj)
 {
-	const uint32_t nw = (m + 63) / 64;
-	std::vector<uint64_t> basis((size_t)m * nw, 0);
-	std::vector<int32_t> piv(m, -1);
+	const uint32_t nw = (mrows + 63) / 64;
+	std::vector<uint64_t> basis((size_t)count * nw, 0);
+	std::vector<int32_t> piv(count, -1);
 	uint32_t found = 0;
 	const uint64_t kmax = std::min<uint64_t>(L, 8192);
 
 	for (uint64_t k = 0; k < kmax; k++) {
 		for (uint32_t j = 0; j < n; j++) {
-			if (found == m)
+			if (found == count)
 				break;
 			std::vector<uint64_t> v(nw, 0);
-			const uint64_t *Ak = A + k * m;
-			for (uint32_t i = 0; i < m; i++)
+			const uint64_t *Ak = A + k * mrows;
+			for (uint32_t i = 0; i < mrows; i++)
 				if ((Ak[i] >> j) & 1)
 					v[i >> 6] |= 1ull << (i & 63);
 			for (uint32_t p = 0; p < found; p++) {
@@ -96,15 +96,19 @@ static int quad_select(const uint64_t *A, uint32_t m, uint32_t n,
 			jj[found] = j;
 			found++;
 		}
-		if (found == m)
+		if (found == count)
 			break;
 	}
-	if (found < m)
+	if (found < count)
 		return -1;
 	uint32_t t0 = 0;
-	for (uint32_t r = 0; r < m; r++)
+	for (uint32_t r = 0; r < count; r++)
 		t0 = std::max(t0, kk[r]);
-	return (int)t0;
+	/* the identity window must start strictly above every pick
+	 * (CADO's kA <= t0-1 invariant): with t0 == max kk the top pick
+	 * duplicates an identity column, and the resulting trivial
+	 * relations map to W = 0, costing solution dimensions. */
+	return (int)t0 + 1;
 }
 
 /*--------------------------------------------------------------------
@@ -214,6 +218,16 @@ static int quad_bm(const std::vector<uint64_t> &P0, uint32_t b,
 			for (uint32_t r = 0; r < b; r++) {
 				if (r == (uint32_t)pivot)
 					continue;
+				/* CADO minimality discipline: a pivot's
+				 * immediate shift zeroes its current-
+				 * coefficient entries, making it fully
+				 * inert for the rest of the coefficient.
+				 * Our shifts are batched at the end of
+				 * the coefficient, so the same inertia
+				 * requires skipping already-pivoted rows
+				 * as XOR targets too. */
+				if (used[r])
+					continue;
 				if ((h_delta[(size_t)r * mb + cw] >>
 							cb) & 1) {
 					bwq_op_t op;
@@ -224,11 +238,6 @@ static int quad_bm(const std::vector<uint64_t> &P0, uint32_t b,
 					 * lives in [0, t+2) after t
 					 * steps; watermarks proved
 					 * unreliable */
-					op.cextP = std::max(
-						(uint64_t)hi[pivot] + 1,
-						hi[r] ?
-						  std::max((uint64_t)hi[r],
-						    (uint64_t)L) : (uint64_t)L);
 					/* P rows always span the whole
 					 * sequence: extent = L */
 					op.cextP = L;
@@ -252,8 +261,13 @@ static int quad_bm(const std::vector<uint64_t> &P0, uint32_t b,
 			sextF.push_back(0);
 			sextP.push_back(0);
 			hi[pivot]++;
-			if ((uint64_t)hi[pivot] + 2 >= (uint64_t)ncoeff) {
-				fprintf(stderr, "BW quad: row overflow\n");
+			/* P content spans [0, L) plus one coefficient
+			 * per shift, so the binding overflow bound is
+			 * the P arena: L + hi[pivot] < ncoeff */
+			if ((uint64_t)L + hi[pivot] + 2 >=
+					(uint64_t)ncoeff) {
+				fprintf(stderr, "BW quad: row overflow "
+					"(gamma=%u)\n", hi[pivot]);
 				return -1;
 			}
 		}
@@ -322,21 +336,26 @@ int bw_lingen_quad_full(const char *afile, const char *ffile,
 	fclose(f);
 
 	/* augmentation selection */
-	std::vector<uint32_t> kk(m), jj(m);
-	int t0 = quad_select(A.data(), m, n, L, kk, jj);
+	const uint32_t maug = m;
+	std::vector<uint32_t> kk(maug), jj(maug);
+	int t0 = quad_select(A.data(), m, maug, n, L, kk, jj);
 	if (t0 < 0) {
 		fprintf(stderr, "BW quad: selection failed\n");
 		return -1;
 	}
 	fprintf(stderr, "BW quad: t0=%d\n", t0);
-	const uint32_t b = m + n;
+	const uint32_t b = n + maug;
 	const uint32_t bb = (b + 63) / 64;
 	const uint32_t nw = (n + 63) / 64;
 	const uint32_t mb = (m + 63) / 64;
 	/* E' in coefficient-window form: identity columns shifted by
-	 * t0, augmentation columns by kk; BM annihilates this window */
+	 * t0, augmentation columns by kk; BM annihilates this window.
+	 * The P arena must hold the window plus each row's shifts:
+	 * balanced pivoting puts the mean shift count at L*m/b, but the
+	 * per-row spread is a random walk -- observed +1790 (+9*b) over
+	 * the mean at L=9469, so size for a quarter-window overshoot. */
 	const uint64_t LE = L - (uint64_t)t0;
-	const uint64_t ncoeff = LE + b + 64;
+	const uint64_t ncoeff = LE + LE * m / b + LE / 4 + 4 * b + 1024;
 	const uint64_t rowcapP = ncoeff * mb;
 	const uint64_t rowcapF = ncoeff * bb;
 
@@ -351,7 +370,7 @@ int bw_lingen_quad_full(const char *afile, const char *ffile,
 				if ((Ak[i] >> r) & 1)
 					dst[i >> 6] |= 1ull << (i & 63);
 		}
-		for (uint32_t r = 0; r < m; r++) {
+		for (uint32_t r = 0; r < maug; r++) {
 			const uint64_t *Ak = A.data() +
 					(c + (uint64_t)kk[r]) * m;
 			uint64_t *dst = &P0[(size_t)(n + r) * rowcapP +
@@ -411,19 +430,19 @@ int bw_lingen_quad_full(const char *afile, const char *ffile,
 						fw &= fw - 1;
 					}
 				}
-				for (uint32_t rp = 0; rp < m; rp++) {
-					int64_t cc = (int64_t)c - t0 +
-						(int64_t)kk[rp];
-					if (cc < 0 || (uint64_t)cc >= ncoeff)
-						continue;
-					const uint64_t *Fr2 = &Fh[(size_t)r *
-							rowcapF];
-					uint32_t bit = n + rp;
-					if ((Fr2[(uint64_t)cc * bb +
-						(bit >> 6)] >> (bit & 63)) & 1)
-						W[jj[rp] >> 6] |=
-							1ull << (jj[rp] & 63);
-				}
+					for (uint32_t rp = 0; rp < maug; rp++) {
+						int64_t cc = (int64_t)c - t0 +
+							(int64_t)kk[rp];
+						if (cc < 0 || (uint64_t)cc >= ncoeff)
+							continue;
+						const uint64_t *Fr2 = &Fh[(size_t)r *
+								rowcapF];
+						uint32_t bit = n + rp;
+						if ((Fr2[(uint64_t)cc * bb +
+							(bit >> 6)] >> (bit & 63)) & 1)
+							W[jj[rp] >> 6] ^=
+								1ull << (jj[rp] & 63);
+					}
 				for (uint32_t w2 = 0; w2 < nw; w2++) {
 					uint64_t word = W[w2];
 					uint64_t bitbase = (uint64_t)c * n +
@@ -520,17 +539,17 @@ int bw_lingen_quad_full(const char *afile, const char *ffile,
 						Wc[j >> 6] |=
 						1ull << (j & 63);
 			}
-			for (uint32_t rp = 0; rp < m; rp++) {
+			for (uint32_t rp = 0; rp < maug; rp++) {
 				int64_t cc = (int64_t)c - t0 +
 						(int64_t)kk[rp];
 				if (cc < 0)
 					continue;
 				const uint64_t *Fr = &Fh[(size_t)r *
-							rowcapF];
+						rowcapF];
 				uint32_t bit = n + rp;
 				if ((Fr[(uint64_t)cc * bb + (bit >> 6)] >>
 						(bit & 63)) & 1)
-					Wc[jj[rp] >> 6] |=
+					Wc[jj[rp] >> 6] ^=
 						1ull << (jj[rp] & 63);
 			}
 			for (uint32_t w = 0; w < nw; w++)
@@ -553,8 +572,38 @@ int bw_lingen_quad_full(const char *afile, const char *ffile,
 				break;
 		}
 	}
+	/* trim trailing zero coefficient blocks (across all candidates):
+	 * the file degree must be exactly max deg(W) so that the leading
+	 * block is nonzero -- consumers rely on it (as does the test) */
+	{
+		const size_t bwords = cand.size() * nw;
+		while (Dlen > 1) {
+			uint64_t orv = 0;
+			for (size_t i2 = 0; i2 < bwords; i2++)
+				orv |= words[(size_t)(Dlen - 1) * bwords + i2];
+			if (orv)
+				break;
+			Dlen--;
+		}
+		words.resize((size_t)Dlen * bwords);
+	}
 	fprintf(stderr, "BW quad: F degree %llu (t0=%d)\n",
 		(unsigned long long)Dlen - 1, t0);
+
+	/* the file is trailing-first, matching lingen_output_to_singlefile
+	 * and both consumers (the test identity pairs A[k-d+c] with block
+	 * c, mksol's Horner feeds block ncoef-1-c at step c): block c
+	 * must carry W degree Dlen-1-c. The emit loop built ascending
+	 * order, so reverse the coefficient blocks (word layout inside a
+	 * block is already the consumed transpose). */
+	{
+		const size_t bwords = cand.size() * nw;
+		std::vector<uint64_t> rev(words.size());
+		for (uint64_t c = 0; c < Dlen; c++)
+			memcpy(&rev[(size_t)(Dlen - 1 - c) * bwords],
+				&words[(size_t)c * bwords], bwords * 8);
+		words.swap(rev);
+	}
 
 
 	/* write the F file */
