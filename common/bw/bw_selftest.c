@@ -20,6 +20,21 @@ cases (0/1/63/64/65) and excess-column shapes.
 #include <stdlib.h>
 #include <string.h>
 
+/* from bw_lingen.cpp */
+typedef struct {
+	uint32_t m, n;
+	uint32_t nrows, ncols;
+	const char *afile;
+	const char *ffile;
+	uint64_t seq_len;
+	uint32_t threshold;
+	uint32_t nthreads;
+} bw_lingen_opts_t;
+extern int bw_lingen_run(const bw_lingen_opts_t *o);
+/* from bw.c */
+uint32_t bw_krylov_length(uint64_t N, uint32_t m, uint32_t n,
+			uint32_t *interval_out);
+
 static bw_rng_t g_rng = { 0x123456789abcdef0ULL };
 
 /* CPU reference: full SpMV including dense rows, over la_col_t */
@@ -350,10 +365,253 @@ static int run_case(msieve_obj *obj, uint32_t nrows, uint32_t ncols,
 		free(full);
 	}
 
+	/* full BW loop at small scale: complete Krylov, real lingen,
+	 * complete mksol + nilpotent extraction, then A*x = 0 on the CPU
+	 * (the oracle: any valid kernel vector must pass) */
+	if (getenv("BW_TEST_FULL")) {
+		uint32_t interval, L, j, nd = 0;
+		uint64_t *deps = xcalloc(ncols, 8);
+		uint64_t *coef = xmalloc(m * 8);
+		char apath[512], fpath[512];
+		bw_filehdr_t hdr;
+		FILE *fp;
+		uint64_t seed = 0x1111;
+
+		/* the group state advanced 3+1 steps during the checks
+		 * above; restart clean for the full run */
+		bw_gpu_stop(&g);
+		bw_matrix_free(&M);
+		for (i = 0; i < ncols; i++) {
+			free(cols[i].data);
+			cols[i].data = NULL;
+		}
+		free(cols);
+		cols = NULL;
+		if (make_random_matrix(obj, &cols, nrows, ncols, ndr,
+					o->num_gpus, &M))
+			goto out;
+
+		/* fresh Y0/U with a NEW seed so the sequence differs */
+		for (i = 0; i < ncols; i++)
+			h_y0[i] = bw_rng_next(&g_rng);
+		for (i = 0; i < nrows * (m / 64); i++)
+			h_u[i] = bw_rng_next(&g_rng);
+
+		if (bw_gpu_start(&g, &M, o, obj, h_y0, h_u))
+			goto out;
+
+		L = bw_krylov_length(ncols, m, 64, &interval);
+		snprintf(apath, sizeof(apath), "/tmp/bw_st.A");
+		snprintf(fpath, sizeof(fpath), "/tmp/bw_st.F");
+		remove(apath);
+		remove(fpath);
+
+		fp = fopen(apath, "wb");
+		memset(&hdr, 0, 64);
+		hdr.magic = 0x31574241u;
+		hdr.version = 1;
+		hdr.m = m;
+		hdr.n = 64;
+		hdr.seq_len = L;
+		fwrite(&hdr, 1, 64, fp);
+
+		for (j = 0; j < L; j++) {
+			int w;
+			bw_gpu_krylov_step(&g);
+			bw_gpu_reduce_s(&g, coef, m);
+			for (w = 0; w < g.num_workers; w++)
+				CHECK(g.w[w].cuda_error == 0,
+					"full: worker %d cuda ok", w);
+			fwrite(coef, 8, m, fp);
+		}
+		fclose(fp);
+
+		{
+			bw_lingen_opts_t lo;
+			memset(&lo, 0, sizeof(lo));
+			lo.m = m;
+			lo.n = 64;
+			lo.nrows = nrows;
+			lo.ncols = ncols;
+			lo.afile = apath;
+			lo.ffile = fpath;
+			lo.seq_len = L;
+			lo.threshold = 64;
+			lo.nthreads = 4;
+			CHECK(bw_lingen_run(&lo) == 0, "full: lingen ok");
+		}
+
+		/* mksol by hand through the same group commands */
+		{
+			uint64_t *zero = xcalloc(ncols, 8);
+			bw_filehdr_t fh;
+			uint64_t *F;
+			uint32_t nc, c;
+			bw_gpu_upload_x(&g, zero);
+			free(zero);
+			fp = fopen(fpath, "rb");
+			CHECK(fp != NULL, "full: F file exists");
+			if (!fp)
+				goto out;
+			fread(&fh, 1, 64, fp);
+			nc = (uint32_t)fh.seq_len;
+			F = xmalloc((size_t)nc * 64 * 8);
+			CHECK(fread(F, 8, (size_t)nc * 64, fp) ==
+				(size_t)nc * 64, "full: F readable");
+			fclose(fp);
+			for (c = 0; c < nc; c++) {
+				/* transpose in place, trailing-first */
+				uint64_t *Mx = F + (size_t)(nc - 1 - c) * 64;
+				uint32_t r1, r2;
+				for (r1 = 0; r1 < 64; r1++)
+					for (r2 = r1 + 1; r2 < 64; r2++) {
+						uint64_t a = (Mx[r1] >> r2) & 1;
+						uint64_t b = (Mx[r2] >> r1) & 1;
+						if (a != b) {
+							Mx[r1] ^= (uint64_t)1 << r2;
+							Mx[r2] ^= (uint64_t)1 << r1;
+						}
+					}
+				bw_gpu_mksol_step(&g, Mx);
+				/* per-step CPU reference of the Horner state */
+				if (getenv("BW_DEBUG_HORNER")) {
+					static int once = 0;
+					if (!once) {
+						once = 1;
+						/* the GPU started from x=0:
+						 * state = Y0 * F alone */
+						memset(h_xcpu, 0,
+							ncols * 8);
+						cpu_combine(h_xcpu, h_y0,
+							Mx, 64, ncols);
+					} else {
+						cpu_mul(&M, cols, h_xcpu,
+							h_ref);
+						memcpy(h_xcpu, h_ref,
+							nrows * 8);
+						memset(h_xcpu + nrows, 0,
+							(ncols - nrows) * 8);
+						cpu_combine(h_xcpu, h_y0,
+							Mx, 64, ncols);
+					}
+					{
+						uint64_t *got = xcalloc(ncols, 8);
+						uint32_t w2;
+						int nz = 0;
+						bw_gpu_collect(&g);
+						for (w2 = 0; w2 < (uint32_t)g.num_workers; w2++)
+							memcpy(got + M.slabs[w2].xfer_min,
+								g.w[w2].h_stage,
+								(M.slabs[w2].row_max -
+								 M.slabs[w2].xfer_min) * 8);
+						if (g.w[0].h_tail)
+							memcpy(got + nrows, g.w[0].h_tail,
+								(ncols - nrows) * 8);
+						for (w2 = 0; w2 < ncols; w2++)
+							if (got[w2] != h_xcpu[w2]) {
+								nz = 1;
+								if (nz == 1 && c < 4)
+									printf("[dbg] horner step %u word %u: got %016llx ref %016llx\n",
+										c, w2,
+										(unsigned long long)got[w2],
+										(unsigned long long)h_xcpu[w2]);
+								break;
+							}
+						if (nz && c < 4)
+							printf("[dbg] horner step %u DIVERGED\n", c);
+						free(got);
+					}
+				}
+			}
+			free(F);
+			/* nilpotent */
+			for (j = 0; j < 26; j++) {
+				bw_gpu_nil_step(&g);
+				if (bw_gpu_all_zero(&g)) {
+					/* cross-check the flag on the host:
+					 * collect the A*z iterate itself */
+					uint64_t *az = xcalloc(ncols, 8);
+					uint32_t w2;
+					int hostnz = 0;
+					g.cur ^= 1;
+					bw_gpu_collect(&g);
+					for (w2 = 0; w2 < (uint32_t)g.num_workers; w2++) {
+						memcpy(az + M.slabs[w2].xfer_min,
+							g.w[w2].h_stage,
+							(M.slabs[w2].row_max -
+							 M.slabs[w2].xfer_min) * 8);
+						{
+							uint32_t t;
+							for (t = 0; t < M.slabs[w2].row_max - M.slabs[w2].xfer_min; t++)
+								if (g.w[w2].h_stage[t])
+									hostnz = 1;
+						}
+					}
+					if (hostnz)
+						printf("[dbg] flag said zero, "
+							"host sees nonzero "
+							"(iter %u)\n", j);
+					free(az);
+					break;
+				}
+			}
+			CHECK(j < 26, "full: nilpotent converged (%u)",
+				j);
+			bw_gpu_collect(&g);
+			for (i = 0; i < (uint32_t)g.num_workers; i++)
+				memcpy(deps + M.slabs[i].xfer_min,
+					g.w[i].h_stage,
+					(M.slabs[i].row_max -
+					 M.slabs[i].xfer_min) * 8);
+			if (g.w[0].h_tail)
+				memcpy(deps + nrows, g.w[0].h_tail,
+					(ncols - nrows) * 8);
+			{
+				/* oracle: A*x over cols + dense */
+				uint64_t *y = xcalloc(nrows, 8);
+				uint32_t cc, rr, kk;
+				for (cc = 0; cc < ncols; cc++) {
+					uint64_t u = deps[cc];
+					if (!u)
+						continue;
+					for (rr = 0; rr < cols[cc].weight; rr++)
+						y[cols[cc].data[rr]] ^= u;
+					for (kk = 0; kk < M.num_dense_blocks; kk++) {
+						uint64_t dd = M.dense[(size_t)kk * ncols + cc];
+						while (dd) {
+							uint32_t r = __builtin_ctzll(dd);
+							y[64 * kk + r] ^= u;
+							dd &= dd - 1;
+						}
+					}
+				}
+				{
+					uint32_t nbad = 0;
+					for (rr = 0; rr < nrows; rr++)
+						if (y[rr]) {
+							if (nbad < 4)
+								printf("[full] row %u: %016llx\n", rr, (unsigned long long)y[rr]);
+							nbad++;
+						}
+					CHECK(nbad == 0,
+						"full: A*x=0 (%u bad rows)",
+						nbad);
+				}
+				free(y);
+			}
+		}
+		free(deps);
+		(void)seed;
+		bw_gpu_stop(&g);
+		rc = failures;
+		goto out2;
+	}
+
 	bw_gpu_stop(&g);
 	rc = failures;
 
 out:
+out2:
 	bw_matrix_free(&M);
 	if (cols) {
 		for (i = 0; i < ncols; i++)

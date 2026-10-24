@@ -410,7 +410,7 @@ $(BW_OBJS): %.bwo: %.c $(COMMON_HDR)
 common/bw/bw_lingen.bwx: common/bw/bw_lingen.cpp
 	$(CXX) $(BW_CXXFLAGS) -c -o $@ $<
 
-%.bwx: %.cpp
+%.bwx: %.cpp | $(GF2X_STAMP)
 	$(CXX) $(BW_CXXFLAGS) -c -o $@ $<
 
 common/bw/cado/utils/embedded/fmt/format.bwx: common/bw/cado/utils/embedded/fmt/format.cc

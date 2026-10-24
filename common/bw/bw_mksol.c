@@ -77,6 +77,35 @@ int bw_run_mksol(bw_group_t *g, msieve_obj *obj, const bw_opts_t *o,
 		goto out;
 	}
 
+	/* lingen writes transposed coefficients (see the comment in
+	 * lingen_output_to_singlefile); the Horner combine applies matrix
+	 * rows, so transpose each n x n coefficient on the host first */
+	{
+		uint64_t *G = (uint64_t *)xmalloc((size_t)ncoef * o->n *
+						sizeof(uint64_t));
+		memcpy(G, fbuf + BW_HDR_SIZE / 8,
+			(size_t)ncoef * o->n * 8);
+		munmap(fbuf, (size_t)sb.st_size);
+		fbuf = NULL;
+		close(fd);
+		fd = -1;
+		for (c = 0; c < ncoef; c++) {
+			uint64_t *M = G + (size_t)c * o->n;
+			uint32_t r1, r2;
+			for (r1 = 0; r1 < o->n; r1++)
+				for (r2 = r1 + 1; r2 < o->n; r2++) {
+					uint64_t a = (M[r1] >> r2) & 1;
+					uint64_t b = (M[r2] >> r1) & 1;
+					if (a != b) {
+						M[r1] ^= (uint64_t)1 << r2;
+						M[r2] ^= (uint64_t)1 << r1;
+					}
+				}
+		}
+		/* G replaces the mmap; downstream code reads fbuf */
+		fbuf = G;
+	}
+
 	logprintf(obj, "BW mksol: %u coefficients (degree %u)\n",
 			ncoef, ncoef - 1);
 
@@ -85,9 +114,13 @@ int bw_run_mksol(bw_group_t *g, msieve_obj *obj, const bw_opts_t *o,
 	zero = (uint64_t *)xcalloc(g->N, sizeof(uint64_t));
 	bw_gpu_upload_x(g, zero);
 
+	/* consume trailing-first: with Ft[c] = transpose(file[c]) the
+	 * identity is sum_c A_{j+c} Ft[c] = 0, so the kernel candidate
+	 * is z = sum_c A^{d-c} Y Ft[d-c] -- the Horner applies the
+	 * coefficients in reverse file order */
 	for (c = 0; c < ncoef; c++) {
-		bw_gpu_mksol_step(g, fbuf + BW_HDR_SIZE / 8 +
-					(size_t)c * o->n);
+		bw_gpu_mksol_step(g, fbuf + (size_t)(ncoef - 1 - c) *
+					o->n);
 		{
 			int w;
 			for (w = 0; w < g->num_workers; w++)
@@ -154,12 +187,17 @@ int bw_run_mksol(bw_group_t *g, msieve_obj *obj, const bw_opts_t *o,
 				(size_t)(slab->row_max -
 					slab->xfer_min) * 8);
 		}
+		/* the padded tail holds real columns' bits: they are part
+		   of every dependency (A*x = 0 needs them), replicated on
+		   every worker */
+		if (g->w[0].h_tail)
+			memcpy(deps_out + g->M->nrows, g->w[0].h_tail,
+				(size_t)(g->N - g->M->nrows) * 8);
+		else
+			memset(deps_out + g->M->nrows, 0,
+				(size_t)(g->N - g->M->nrows) * 8);
 	}
 
-	/* the padded tail [nrows,N) never participates in A*x; zero it
-	   in the output so deps are pure kernel vectors of the real A */
-	memset(deps_out + g->M->nrows, 0,
-		(size_t)(g->N - g->M->nrows) * 8);
 
 	/* drop zero and duplicate candidates (bit-planes of deps) */
 	{
@@ -209,8 +247,20 @@ int bw_run_mksol(bw_group_t *g, msieve_obj *obj, const bw_opts_t *o,
 
 	if (o->verify_cpu) {
 		if (verify_cpu(g, obj, deps_out, NULL)) {
+			char dpath[512];
 			logprintf(obj, "error: BW CPU verification of "
 					"candidates failed\n");
+			bw_path(dpath, sizeof(dpath), obj,
+				".bw.deps.dump");
+			{
+				FILE *df = fopen(dpath, "wb");
+				if (df) {
+					fwrite(deps_out, 8, g->N, df);
+					fclose(df);
+					logprintf(obj, "BW: deps dumped "
+						"to %s\n", dpath);
+				}
+			}
 			goto out;
 		}
 	}
@@ -220,7 +270,7 @@ int bw_run_mksol(bw_group_t *g, msieve_obj *obj, const bw_opts_t *o,
 
 out:
 	if (fbuf)
-		munmap(fbuf, (size_t)sb.st_size);
+		free(fbuf);       /* heap copy after the transpose */
 	if (fd >= 0)
 		close(fd);
 	free(zero);

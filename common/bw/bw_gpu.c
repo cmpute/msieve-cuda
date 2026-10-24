@@ -165,6 +165,10 @@ static void worker_do_step(bw_worker_t *w)
 		bw_combine64(xout, w->d_y0, w->d_fcoef, g->N,
 				w->compute);
 		CUDA_CHK(w, cudaEventRecord(w->ev_comp, w->compute));
+		/* the allgather reads xout on the copy stream: it must
+		 * wait for the compute stream's SpMV+combine (this was
+		 * missing, and the staged D2H raced the kernels) */
+		CUDA_CHK(w, cudaStreamWaitEvent(w->copy, w->ev_comp, 0));
 	}
 	else {	/* BW_CMD_NIL_STEP */
 		bw_anyset64(xout + slab->xfer_min,
@@ -181,6 +185,18 @@ static void worker_do_step(bw_worker_t *w)
 		CUDA_CHK(w, cudaMemcpyAsync(&w->h_flag,
 			w->d_hist[BW_HIST_DEPTH], 8,
 			cudaMemcpyDeviceToHost, w->copy));
+		if (getenv("BW_DEBUG_NIL")) {
+			uint64_t dbg = 0xfeed;
+			cudaStreamSynchronize(w->copy);
+			cudaMemcpy(&dbg, w->d_hist[BW_HIST_DEPTH], 8,
+					cudaMemcpyDeviceToHost);
+			printf("[dbg] w%d h_flag=%llx direct=%llx "
+				"hist_ptr=%llu\n", w->idx,
+				(unsigned long long)w->h_flag,
+				(unsigned long long)dbg,
+				(unsigned long long)g->hist_ptr);
+			fflush(stdout);
+		}
 	}
 
 	worker_allgather(w, g->cmd == BW_CMD_MKSOL_STEP ||
@@ -249,6 +265,10 @@ static int worker_alloc_and_upload(bw_worker_t *w)
 				cudaHostAllocDefault));
 	CUDA_CHK(w, cudaHostAlloc((void **)&w->h_stage,
 				slab_words * 8, cudaHostAllocDefault));
+	if (w->idx == 0 && g->N > M->nrows)
+		CUDA_CHK(w, cudaHostAlloc((void **)&w->h_tail,
+				(size_t)(g->N - M->nrows) * 8,
+				cudaHostAllocDefault));
 
 	/* Y0 and the initial state */
 	CUDA_CHK(w, cudaMemcpy(w->d_y0, g->h_y0,
@@ -307,6 +327,7 @@ static void worker_free(bw_worker_t *w)
 		if (w->d_hist[i]) cudaFree(w->d_hist[i]);
 	if (w->h_s) cudaFreeHost(w->h_s);
 	if (w->h_stage) cudaFreeHost(w->h_stage);
+	if (w->h_tail) cudaFreeHost(w->h_tail);
 	memset(&w->spmv, 0, sizeof(*w) - offsetof(bw_worker_t, spmv));
 }
 
@@ -392,6 +413,13 @@ static void *worker_main(void *arg)
 					(size_t)(slab->row_max -
 						slab->xfer_min) * 8,
 					cudaMemcpyDeviceToHost));
+				if (w->idx == 0 && w->h_tail)
+					CUDA_CHK(w, cudaMemcpy(w->h_tail,
+						w->d_x[g->cur] +
+							g->M->nrows,
+						(size_t)(g->N -
+							g->M->nrows) * 8,
+						cudaMemcpyDeviceToHost));
 			}
 			break;
 

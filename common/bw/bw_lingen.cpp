@@ -36,6 +36,7 @@ extern "C" {
 
 typedef struct {
 	uint32_t m, n;
+	uint32_t nrows, ncols;   /* matrix dims for the F header */
 	const char *afile;
 	const char *ffile;
 	uint64_t seq_len;
@@ -130,8 +131,8 @@ int bw_lingen_run(const bw_lingen_opts_t *o)
 		hdr.version = BW_FORMAT_VERSION;
 		hdr.m = o->m;
 		hdr.n = o->n;
-		hdr.nrows = 0;
-		hdr.ncols = 0;
+		hdr.nrows = o->nrows;
+		hdr.ncols = o->ncols;
 		hdr.seq_len = (uint64_t)(rawlen / ((long)o->n * 8));
 		if (fwrite(&hdr, 1, 64, out) != 64)
 			return -1;

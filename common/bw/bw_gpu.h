@@ -68,6 +68,9 @@ struct bw_worker {
 	/* pinned staging */
 	uint64_t *h_s;           /* m words */
 	uint64_t *h_stage;       /* slab words */
+	uint64_t *h_tail;        /* worker 0 only: the replicated padded
+				    tail [nrows,N), part of the state and
+				    of every dependency */
 	uint64_t h_flag;         /* slab-zero flag after NIL_STEP */
 	int cuda_error;          /* first error code, sticky */
 };

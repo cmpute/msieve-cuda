@@ -22,6 +22,7 @@ Option parsing and phase sequencing for the Block Wiedemann solver.
 /* lingen C ABI (bw_lingen.cpp) */
 typedef struct {
 	uint32_t m, n;
+	uint32_t nrows, ncols;   /* matrix dims for the F header */
 	const char *afile;
 	const char *ffile;
 	uint64_t seq_len;
@@ -263,7 +264,7 @@ static uint32_t isqrt64(uint64_t x) {
 }
 
 /* Krylov length per BW.md (CADO-derived) */
-static uint32_t bw_krylov_length(uint64_t N, uint32_t m, uint32_t n,
+uint32_t bw_krylov_length(uint64_t N, uint32_t m, uint32_t n,
 				uint32_t *interval_out)
 {
 	uint64_t L = (N + m - 1) / m + (N + n - 1) / n +
@@ -481,6 +482,8 @@ uint64_t *bw_solve(msieve_obj *obj,
 		memset(&lo, 0, sizeof(lo));
 		lo.m = o.m;
 		lo.n = o.n;
+		lo.nrows = nrows;
+		lo.ncols = ncols;
 		lo.afile = apath;
 		lo.ffile = fpath;
 		lo.seq_len = L;
