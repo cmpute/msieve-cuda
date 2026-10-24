@@ -285,13 +285,21 @@ krylov 69/91/107 s and mksol 64/89/64 s at 1/2/3 GPUs):
 | gpus | krylov | mksol | deps |
 | ---- | ------ | ----- | ---- |
 | 1    | 85 s*  | 36 s  | 44   |
-| 2    | (running) | (running) | 44 |
-| 3    | (running) | (running) | 44 |
+| 2    | 77 s   | 35 s  | 44   |
+| 3    | 64 s   | 35 s  | 44   |
+
+Instrumentation confirms the design point: xfer 0.0 MB/step at every
+W, and per-worker GPU compute 1.260-1.279 ms/step at any worker
+count -- plane mode is perfectly load-balanced by construction
+(rows mode was 0.408/0.198/0.471 at W=3). GPU-phase totals
+(krylov+mksol): rows 133/180/171 s -> plane 121/112/99 s; the
+negative scaling is gone and multi-GPU now beats the single-GPU
+rows baseline. The krylov spread across rows (64-85 s) is main-
+thread A-file write jitter, not GPU variance (compute is flat;
+barstart ranged 0.008-0.318 ms/step with load ~17).
 
 *the W=1 GPU compute is identical to the rows baseline (1.279 vs
-1.287 ms/step); the 85 s vs 69 s gap is main-thread A-file write
-jitter (barstart 0.318 vs 0.073 ms/step) under load ~17, not a
-code regression. mksol 36 s confirms the wasted-D2H fix (was 64 s).
+1.287 ms/step); mksol 36 s confirms the wasted-D2H fix (was 64 s).
 
 Expectation from the component numbers: krylov ~= the 1-GPU row at
 any W (full-matrix compute per GPU, no exchange) and mksol ~38 s
