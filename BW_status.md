@@ -202,12 +202,12 @@ Pipeline bug found and fixed on the way:
 Multi-GPU timing table (RSA-120 matrix N=2.1M, L=49408, phases from
 the log; PCIe, no NVLink; flat allgather unless noted):
 
-  gpus | krylov | lingen | mksol | deps
-  -----+--------+--------+-------+-----
-    1  |  76 s  | 205 s  |  85 s | 44
-    2  | 113 s  | 247 s  |  80 s | 44
-    3  | 107 s  | 183 s  |  64 s | 44
-  3,hier | 127 s | 174 s | 65 s | 44
+| gpus | krylov | lingen | mksol | deps |
+| ---- | ------ | ------ | ----- | ---- |
+| 1    | 76 s   | 205 s  | 85 s  | 44   |
+| 2    | 113 s  | 247 s  | 80 s  | 44   |
+| 3    | 107 s  | 183 s  | 64 s  | 44   |
+| 3,hier | 127 s | 174 s | 65 s  | 44   |
 
 FINDING: multi-GPU Krylov is NET NEGATIVE at this size -- 2 GPUs is
 49% slower than 1. Per-step: 1.54 ms (1 GPU) vs 2.17-2.57 ms (2-3
@@ -239,12 +239,14 @@ same BL-job CPU contention, GPUs 1-3 (RSA-120 matrix, m=128 n=64,
 N=2.1M, L=49408; runs earlier in the evening used GPU lists 1 / 1,2
 / 1,2,3):
 
-  krylov, per step:      1 gpu      2 gpus          3 gpus
-    gpu compute (max)    1.287 ms   0.810 ms        0.471 ms
-    exchanged/step       0          16.8 MB         16.9 MB in+out/GPU
-    step wall            ~1.4 ms    1.84 ms         2.17 ms
-    phase total          69 s       91 s            107 s
-  mksol (staged path):   64 s       89 s            64 s
+| krylov, per step   | 1 gpu  | 2 gpus | 3 gpus |
+| ------------------ | ------ | ------ | ------ |
+| gpu compute (max)  | 1.287 ms | 0.810 ms | 0.471 ms |
+| exchanged/step     | 0      | 16.8 MB | 16.9 MB in+out per GPU |
+| step wall          | ~1.4 ms | 1.84 ms | 2.17 ms |
+| phase total        | 69 s   | 91 s   | 107 s  |
+
+mksol (staged path): 64 s / 89 s / 64 s at 1/2/3 GPUs.
 
 Verdict: communication, and provably not an implementation knob.
 (a) peer pushes already run at wire speed (~16 GB/s effective on
@@ -276,11 +278,20 @@ Validation: identity + closed-loop selftests green in plane mode on
 2/3 GPUs and unchanged in rows mode; RSA-100 plane e2e reproduces
 the published p50 pair (47 deps, same as rows).
 
-Plane timing rows (RSA-120, GPUs 1-3, same evening conditions):
-  gpus | krylov | mksol | deps      (rows-mode reference: 69/91/107 + 64/89/64)
-    1   |   s    |   s   | 44
-    2   |   s    |   s   | 44
-    3   |   s    |   s   | 44
+Plane timing rows (RSA-120, GPUs 1-3, same evening conditions;
+rows-mode reference with the same instrumentation this evening:
+krylov 69/91/107 s and mksol 64/89/64 s at 1/2/3 GPUs):
+
+| gpus | krylov | mksol | deps |
+| ---- | ------ | ----- | ---- |
+| 1    | 85 s*  | 36 s  | 44   |
+| 2    | (running) | (running) | 44 |
+| 3    | (running) | (running) | 44 |
+
+*the W=1 GPU compute is identical to the rows baseline (1.279 vs
+1.287 ms/step); the 85 s vs 69 s gap is main-thread A-file write
+jitter (barstart 0.318 vs 0.073 ms/step) under load ~17, not a
+code regression. mksol 36 s confirms the wasted-D2H fix (was 64 s).
 
 Expectation from the component numbers: krylov ~= the 1-GPU row at
 any W (full-matrix compute per GPU, no exchange) and mksol ~38 s
