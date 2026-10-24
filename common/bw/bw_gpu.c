@@ -136,6 +136,14 @@ static void worker_do_step(bw_worker_t *w)
 	worker_step_spmv(w);
 
 	if (g->cmd == BW_CMD_KRYLOV_STEP) {
+		if (getenv("BW_DBG_HS")) {
+			static const uint64_t *last[8] = {0};
+			if (last[w->idx] && last[w->idx] != w->h_s)
+				fprintf(stderr, "[w%d] h_s CHANGED %p -> %p\n",
+					w->idx, (void *)last[w->idx],
+					(void *)w->h_s);
+			last[w->idx] = w->h_s;
+		}
 		/* the oprod kernel XOR-accumulates into s */
 		CUDA_CHK(w, cudaMemsetAsync(w->d_s, 0,
 				g->o->m * 8, w->compute));
@@ -263,6 +271,9 @@ static int worker_alloc_and_upload(bw_worker_t *w)
 
 	CUDA_CHK(w, cudaHostAlloc((void **)&w->h_s, g->o->m * 8,
 				cudaHostAllocDefault));
+	if (getenv("BW_DBG_HS"))
+		fprintf(stderr, "[w%d] h_s=%p after alloc\n", w->idx,
+			(void *)w->h_s);
 	CUDA_CHK(w, cudaHostAlloc((void **)&w->h_stage,
 				slab_words * 8, cudaHostAllocDefault));
 	if (w->idx == 0 && g->N > M->nrows)
@@ -291,6 +302,9 @@ static int worker_alloc_and_upload(bw_worker_t *w)
 				cudaMemcpyHostToDevice));
 	}
 
+	if (getenv("BW_DBG_HS"))
+		fprintf(stderr, "[w%d] h_s=%p leaving alloc (err=%d)\n",
+			w->idx, (void *)w->h_s, w->cuda_error);
 	return w->cuda_error ? -1 : 0;
 }
 

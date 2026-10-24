@@ -97,6 +97,9 @@ static int bw_opt_one(bw_opts_t *o, const char *key, const char *val,
 		o->n = (uint32)v;
 	}
 	else if (!strcmp(key, "bw_gpus")) {
+		/* the value is a comma list, but ',' also separates nfs_args
+		 * options: consume digits and commas only, so
+		 * bw_gpus=1,2,bw_keep=1 parses as two options */
 		o->num_gpus = 0;
 		while (*val && o->num_gpus < BW_MAX_GPUS) {
 			char *end;
@@ -105,8 +108,11 @@ static int bw_opt_one(bw_opts_t *o, const char *key, const char *val,
 				return -1;
 			o->gpus[o->num_gpus++] = (int)d;
 			val = end;
-			while (*val == ',' || *val == ' ')
-				val++;
+			if (*val != ',')
+				break;      /* next option or end */
+			val++;
+			if (!isdigit((unsigned char)*val))
+				break;      /* ",bw_..." style separator */
 		}
 		if (o->num_gpus == 0) {
 			logprintf(obj, "error: bw_gpus needs at least one "
@@ -198,6 +204,20 @@ static int bw_scan(bw_opts_t *o, const char *p, msieve_obj *obj) {
 		return -1;
 	klen = (size_t)(eq - p);
 	vlen = strcspn(eq + 1, ",");
+	/* bw_gpus is itself a comma list; take everything up to the next
+	 * ",bw" (option separator) or end of string */
+	if (klen == 7 && !strncmp(p, "bw_gpus", 7)) {
+		const char *q = eq + 1;
+		const char *c;
+		vlen = 0;
+		while ((c = strchr(q + vlen, ',')) != NULL) {
+			if (!strncmp(c, ",bw_", 4))
+				break;
+			vlen = (size_t)(c - q) + 1;
+		}
+		if (!c)
+			vlen = strlen(q);
+	}
 	if (klen >= sizeof(key) || vlen >= sizeof(val))
 		return -1;
 	memcpy(key, p, klen); key[klen] = '\0';
@@ -211,7 +231,20 @@ int bw_opts_parse(bw_opts_t *o, msieve_obj *obj, const char *args) {
 	while (p && *p) {
 		const char *comma = strchr(p, ',');
 		size_t len = comma ? (size_t)(comma - p) : strlen(p);
-		char tok[256];
+		char tok[512];
+		/* keep "bw_gpus=1,2,3" as one token: extend past commas
+		 * that are followed by a digit */
+		while (comma && isdigit((unsigned char)comma[1])) {
+			const char *next = strchr(comma + 1, ',');
+			size_t nlen = next ? (size_t)(next - p)
+					: strlen(p);
+			if (nlen >= sizeof(tok))
+				break;
+			len = nlen;
+			comma = next;
+			if (!comma)
+				break;
+		}
 		if (len >= sizeof(tok))
 			return -1;
 		memcpy(tok, p, len);

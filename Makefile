@@ -142,6 +142,9 @@ endif
 
 LIBS += -lgmp -lm -lpthread
 
+# BW rule blocks sit before the classic targets; keep 'all' the default
+.DEFAULT_GOAL := all
+
 #---------------------------------- Generic file lists -------------------
 
 COMMON_HDR = \
@@ -390,9 +393,6 @@ BW_CXXFLAGS = -O2 -g -std=c++20 -fopenmp -march=native \
 	-I$(GF2X_DIR) \
 	-I"$(CUDA_ROOT)/include"
 
-# the rule block below must not become the default goal
-.DEFAULT_GOAL := all
-
 $(GF2X_STAMP):
 	cd $(GF2X_DIR) && \
 	(if [ "$(BW_GPL_GF2X)" != "1" ]; then \
@@ -404,7 +404,9 @@ $(GF2X_STAMP):
 $(GF2X_LIB): $(GF2X_STAMP)
 	cd $(GF2X_DIR) && $(MAKE) libgf2x.la
 
-$(BW_OBJS): %.bwo: %.c $(COMMON_HDR)
+$(BW_OBJS): %.bwo: %.c $(COMMON_HDR) common/bw/bw.h common/bw/bw_gpu.h \
+			common/bw/bw_matrix.h common/bw/bw_seq.h \
+			common/bw/bw_checkpoint.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 common/bw/bw_lingen.bwx: common/bw/bw_lingen.cpp
@@ -436,7 +438,9 @@ bw_test: common/bw/bw_selftest.bwo $(BW_OBJS) $(BW_KERNEL_OBJ) \
 		$(BW_KERNEL_OBJ) $(BW_LINGEN_OBJ) $(BW_CADO_OBJS) $(GF2X_LIB) \
 		libmsieve.a $(LIBS)
 
-common/bw/bw_selftest.bwo: common/bw/bw_selftest.c $(COMMON_HDR)
+common/bw/bw_selftest.bwo: common/bw/bw_selftest.c $(COMMON_HDR) \
+			common/bw/bw.h common/bw/bw_gpu.h common/bw/bw_matrix.h \
+			common/bw/bw_seq.h common/bw/bw_checkpoint.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 BW_ALL = $(BW_OBJS) $(BW_KERNEL_OBJ) $(BW_LINGEN_OBJ) $(BW_CADO_OBJS)
