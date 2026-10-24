@@ -38,6 +38,7 @@ int bwq_download(void *, const void *, uint64_t, void *);
 int bwq_alloc(void **, uint64_t);
 void bwq_free(void *);
 int bwq_sync(void *);
+void bwq_stream_destroy(void *);
 int bwq_set_device(int, void **);
 }
 
@@ -305,6 +306,7 @@ static int quad_bm(const uint64_t *P0, uint32_t b,
 	bwq_free(dF); bwq_free(dP); bwq_free(d_delta);
 	bwq_free(d_ops); bwq_free(d_rows); bwq_free(d_extF);
 	bwq_free(d_extP); bwq_free(dA);
+	bwq_stream_destroy(stream);
 	return 0;
 }
 

@@ -13,6 +13,7 @@ are distinct), then one batched shift launch for all pivot rows.
 --------------------------------------------------------------------*/
 
 #include <cuda_runtime.h>
+#include <cstdio>
 #include <cstdint>
 
 typedef unsigned long long ull_t;
@@ -177,7 +178,21 @@ int bwq_download(void *h, const void *d, uint64_t bytes, void *stream)
 int bwq_alloc(void **p, uint64_t bytes)
 {
 	cudaError_t e = cudaMalloc(p, bytes);
-	return e == cudaSuccess ? 0 : -1;
+	if (e != cudaSuccess) {
+		cudaError_t l = cudaGetLastError();
+		fprintf(stderr, "BW quad: cudaMalloc(%llu bytes) failed: "
+			"%s (sticky: %s)\n",
+			(unsigned long long)bytes,
+			cudaGetErrorString(e),
+			cudaGetErrorString(l));
+		return -1;
+	}
+	return 0;
+}
+
+void bwq_stream_destroy(void *s)
+{
+	cudaStreamDestroy((cudaStream_t)s);
 }
 
 void bwq_free(void *p) { cudaFree(p); }

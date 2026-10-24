@@ -180,6 +180,50 @@ closed-loop selftests (own default, quad) green after the removal.
 Remaining LGPL-2.1+ surface: gf2x only (LGPL build by default, the
 GPL Toom file swapped for the placeholder; BW_GPL_GF2X=1 opts in).
 
+## RSA-120: end-to-end + the multi-GPU timing table (2026-10-24, night)
+
+First full pipeline at c120 scale, all on our own code paths: msieve
+GPU polyfind (4m54s) -> cuda-sieve 3 GPUs (52% of three 1M-wide q
+bands, 163M unique relations) -> msieve filter (matrix 2,099,776 x
+2,099,776 + 89 dense rows) -> BW (own+gf2x lingen) -> sqrt. RSA-120
+factors out of dependency plane 23: two p60, product verified.
+
+Pipeline bug found and fixed on the way:
+- the own recursion's delta bookkeeping double-counted (deltaL +
+  deltaR at each combine), inflating column degrees ~2x per level
+  until basecase arenas reached 26.7 GB and cudaMalloc failed. The
+  correct semantics (CADO's) is a single shared array mutated in
+  place: left updates it, right inherits and updates, no addition at
+  the combine. Symptom before the fix: slow 69-153 s leaf calls
+  (10-GB-class arenas); after: whole -nc2 fits and the ladder stays
+  green. Also: bwq_alloc now reports size + CUDA error, and the
+  engine destroys its stream per call.
+
+Multi-GPU timing table (RSA-120 matrix N=2.1M, L=49408, phases from
+the log; PCIe, no NVLink; flat allgather unless noted):
+
+  gpus | krylov | lingen | mksol | deps
+  -----+--------+--------+-------+-----
+    1  |  76 s  | 205 s  |  85 s | 44
+    2  | 113 s  | 247 s  |  80 s | 44
+    3  | 107 s  | 183 s  |  64 s | 44
+  3,hier | 127 s | 174 s | 65 s | 44
+
+FINDING: multi-GPU Krylov is NET NEGATIVE at this size -- 2 GPUs is
+49% slower than 1. Per-step: 1.54 ms (1 GPU) vs 2.17-2.57 ms (2-3
+GPUs): the per-step cross-GPU gather (host-mediated, barrier per
+step) costs more than the slab-parallel spmv saves at N=2.1M on
+PCIe. lingen stays single-GPU+CPU (its variance across rows is BL-job
+CPU contention, load avg ~30). mksol improves mildly (85->64 s).
+
+So for THIS hardware the Krylov allgather path is the blocker, not
+the compute. Candidates (next): overlap gather with spmv (pipelined
+per-slab), device-mediated gather (peer copies, no host bounce),
+vector-window xfer_min batching across steps, or run one BW instance
+per GPU with independent Y blocks (embarrassingly parallel, no
+gather) and merge at lingen input. The 4-GPU row waits for GPU0
+(the C263 BL job holds it).
+
 ## Open (next session)
 
 - multi-GPU scaling table on this matrix (1 vs 2 vs 3 GPUs).

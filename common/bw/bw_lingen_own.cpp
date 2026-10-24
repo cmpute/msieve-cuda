@@ -181,8 +181,7 @@ sizing follows bw_lingen_quad.cpp (window + shift share + spread).
 --------------------------------------------------------------------*/
 static int own_rec(const std::vector<uint64_t> &E, uint32_t b,
 		uint32_t m, uint64_t L, uint32_t thresh, int dev,
-		const std::vector<uint32_t> &delta_in,
-		std::vector<uint32_t> &delta_out,
+		std::vector<uint32_t> &delta,
 		std::vector<uint64_t> &pi, uint64_t &pi_len)
 {
 	const uint32_t mb = (m + 63) / 64;
@@ -191,15 +190,14 @@ static int own_rec(const std::vector<uint64_t> &E, uint32_t b,
 	if (L <= thresh) {
 		uint32_t maxinit = 0;
 		for (uint32_t r = 0; r < b; r++)
-			maxinit = std::max(maxinit, delta_in[r]);
+			maxinit = std::max(maxinit, delta[r]);
 		uint64_t ncoeff = L + L * m / b + maxinit + L / 4 +
 					4 * b + 1024;
-		delta_out.assign(b, 0);
 		std::vector<uint64_t> F((size_t)b * ncoeff * bb, 0);
 		double t0 = own_now();
 		if (bwq_basecase(E.data(), L * mb, b, m, (uint32_t)L,
-				(uint32_t)ncoeff, dev, delta_in.data(),
-				delta_out.data(), F.data())) {
+				(uint32_t)ncoeff, dev, delta.data(),
+				delta.data(), F.data())) {
 			fprintf(stderr, "BW own: basecase failed (L=%llu)\n",
 				(unsigned long long)L);
 			return -1;
@@ -223,9 +221,7 @@ static int own_rec(const std::vector<uint64_t> &E, uint32_t b,
 			&E[(size_t)r * L * mb], (size_t)half * mb * 8);
 	std::vector<uint64_t> piL;
 	uint64_t lenL;
-	std::vector<uint32_t> deltaL;
-	if (own_rec(El, b, m, half, thresh, dev, delta_in, deltaL,
-			piL, lenL))
+	if (own_rec(El, b, m, half, thresh, dev, delta, piL, lenL))
 		return -1;
 	fprintf(stderr, "BW own: split L=%llu left %llu done (%.2fs)\n",
 		(unsigned long long)L, (unsigned long long)half,
@@ -239,9 +235,7 @@ static int own_rec(const std::vector<uint64_t> &E, uint32_t b,
 
 	std::vector<uint64_t> piR;
 	uint64_t lenR;
-	std::vector<uint32_t> deltaR;
-	if (own_rec(R, b, m, L - half, thresh, dev, deltaL, deltaR,
-			piR, lenR))
+	if (own_rec(R, b, m, L - half, thresh, dev, delta, piR, lenR))
 		return -1;
 
 	/* combine: pi_j = sum_k piR[k,j] * piL_k */
@@ -250,9 +244,6 @@ static int own_rec(const std::vector<uint64_t> &E, uint32_t b,
 	uint64_t len = own_tops(piC, b, bb, lenL + lenR);
 	own_copy_rows(pi, piC, b, bb, lenL + lenR, len);
 	pi_len = len;
-	delta_out.assign(b, 0);
-	for (uint32_t r = 0; r < b; r++)
-		delta_out[r] = deltaL[r] + deltaR[r];
 	fprintf(stderr, "BW own: split L=%llu combine -> deg %llu "
 		"(%.2fs)\n", (unsigned long long)L,
 		(unsigned long long)(len - 1), own_now() - t0);
@@ -388,8 +379,8 @@ int bw_lingen_own_full(const char *afile, const char *ffile,
 	/* the recursion */
 	std::vector<uint64_t> pi;
 	uint64_t pi_len;
-	std::vector<uint32_t> delta0(b, 0), delta1;
-	if (own_rec(E, b, m, LE, threshold, dev, delta0, delta1, pi,
+	std::vector<uint32_t> delta0(b, 0);
+	if (own_rec(E, b, m, LE, threshold, dev, delta0, pi,
 			pi_len)) {
 		fprintf(stderr, "BW own: recursion failed\n");
 		return -1;
