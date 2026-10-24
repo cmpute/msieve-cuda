@@ -89,17 +89,6 @@ std::string sha1sum(matpoly<is_binary> const & X)
 template<typename matpoly_type>
 struct matpoly_diverter;
 
-/* bw-local: optional quadratic GPU basecase (public domain, see
- * bw_lingen_quad.cpp); selected with bw_lingen_impl=quad */
-extern "C" {
-extern int bw_lingen_quad_flag;
-extern int bw_lingen_quad_dev;
-long long bw_lingen_quad_core(const unsigned long long * E,
-        unsigned int m, unsigned int b, unsigned int E_len,
-        unsigned int * gamma, int * lucky, unsigned int * t_out,
-        unsigned long long * pi_out, int dev);
-}
-
 template<bool is_binary>
 struct matpoly_diverter<matpoly<is_binary>> {
     static constexpr const char * prefix = "";
@@ -108,28 +97,6 @@ struct matpoly_diverter<matpoly<is_binary>> {
     }
     static matpoly<is_binary> basecase(bmstatus<is_binary> & bm, matpoly<is_binary> & E) {
         E.clear_high_word();
-        if (bw_lingen_quad_flag) {
-            unsigned int const m = bm.d.m;
-            unsigned int const b = m + bm.d.n;
-            unsigned int const L = E.get_size();
-            std::vector<unsigned int> gamma(bm.delta);
-            std::vector<int> lucky(bm.lucky);
-            unsigned int t = bm.t;
-            long long ncoeff = (long long)L + b + 64;
-            matpoly<is_binary> pi(&bm.d.ab, b, b, (size_t)ncoeff);
-            pi.zero_pad((size_t)ncoeff);
-            if (bw_lingen_quad_core(
-                        (const unsigned long long *)E.data_area(),
-                        m, b, L, gamma.data(), lucky.data(), &t,
-                        (unsigned long long *)pi.data_area(),
-                        bw_lingen_quad_dev) < 0)
-                throw std::runtime_error("quad basecase failed");
-            std::copy(gamma.begin(), gamma.end(), bm.delta.begin());
-            std::copy(lucky.begin(), lucky.end(), bm.lucky.begin());
-            bm.t = t;
-            pi.set_size((size_t)ncoeff);
-            return pi;
-        }
         return bw_lingen_basecase(bm, E);
     }
 };

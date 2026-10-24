@@ -20,6 +20,7 @@ recursion threshold passed in the options.
 #include "lingen_io_wrappers.hpp"
 #include "lingen_matpoly_select.hpp"
 #include "lingen_expected_pi_length.hpp"
+#include "bw_lingen_quad.h"
 #include <omp.h>
 #include <cstdio>
 #include <cstring>
@@ -63,6 +64,19 @@ int bw_lingen_run(const bw_lingen_opts_t *o)
 	bm.lingen_threshold = o->threshold;
 	bw_lingen_quad_flag = (g_bw_lingen_impl == 1);
 	bw_lingen_quad_dev = (int)g_bw_lingen_dev;
+
+	/* the quad track is fully self-contained: no CADO machinery */
+	if (bw_lingen_quad_flag) {
+		if (bw_lingen_quad_full(o->afile, o->ffile, o->m, o->n,
+					o->seq_len, o->nrows, o->ncols,
+					bw_lingen_quad_dev, 3,
+					o->nthreads)) {
+			fprintf(stderr, "BW quad: full lingen failed\n");
+			return -1;
+		}
+		fprintf(stderr, "BW lingen: F written to %s\n", o->ffile);
+		return 0;
+	}
 
 	if (o->nthreads > 0)
 		omp_set_num_threads((int)o->nthreads);

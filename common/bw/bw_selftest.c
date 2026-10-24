@@ -429,6 +429,10 @@ static int run_case(msieve_obj *obj, uint32_t nrows, uint32_t ncols,
 		{
 			bw_lingen_opts_t lo;
 			memset(&lo, 0, sizeof(lo));
+			if (getenv("QUAD")) {
+				extern uint32_t g_bw_lingen_impl;
+				g_bw_lingen_impl = 1;
+			}
 			lo.m = m;
 			lo.n = 64;
 			lo.nrows = nrows;
