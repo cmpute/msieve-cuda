@@ -96,6 +96,10 @@ else
 	CUDA_SINGLE_BINARY ?= 1
 endif
 	CFLAGS += -I"$(CUDA_ROOT)/include" -Icub -DHAVE_CUDA
+	# the CUDA 13 headers emit v4 driver-API symbols that only the
+	# forward-compat libcuda carries on this driver; a plain search
+	# path, harmless on newer drivers
+	LIBS += -L"$(CUDA_ROOT)/compat/lib"
 ifeq ($(CUDA_SINGLE_BINARY),1)
 	CFLAGS += -DMSIEVE_CUDA_SINGLE_BINARY
 	LIBS += $(CUDA_RUNTIME_LIBS) $(CUDA_DRIVER_LIBS)
@@ -323,10 +327,6 @@ $(error BW=1 cannot be combined with MPI)
 endif
 
 CFLAGS += -DHAVE_BW -Icommon/bw
-
-# the CUDA 13 headers emit v4 driver-API symbols that only the
-# forward-compat libcuda carries on this driver; harmless elsewhere
-LIBS += -L"$(CUDA_ROOT)/compat/lib"
 
 # the LGPL gf2x variant (default) builds with the placeholder Toom
 # code; BW_GPL_GF2X=1 keeps the faster GPL-3.0 file instead
