@@ -15,6 +15,9 @@ $Id$
 #include <common.h>
 #include "gnfs.h"
 #include <dirent.h>
+#ifdef HAVE_BW
+#include "bw.h"
+#endif
 
 /* the number of quadratic characters for each
    matrix column. A practical upper limit given
@@ -748,6 +751,7 @@ void nfs_solve_linear_system(msieve_obj *obj, mpz_t n) {
 	uint32 all_matbuild = 0;
 	double select_density = 0;
 	time_t cpu_time = time(NULL);
+	int bw_used = 0;
 #ifdef HAVE_MPI
 	int32 grid_bools[2] = {0};
 	int32 grid_dims[2];
@@ -1200,6 +1204,36 @@ void nfs_solve_linear_system(msieve_obj *obj, mpz_t n) {
 
 		/* solve the linear system */
 
+#ifdef HAVE_BW
+		{
+			bw_opts_t bw;
+			bw_opts_defaults(&bw);
+			if (bw_opts_parse(&bw, obj, obj->nfs_args)) {
+				logprintf(obj, "error: invalid BW options; "
+						"refusing to fall back to "
+						"Lanczos\n");
+				free(cols);
+				return;
+			}
+			bw_used = bw.enabled;
+			if (bw.enabled) {
+				/* BW takes ownership of cols[].data; do not
+				   run form_post_lanczos_matrix here */
+				dependencies = bw_solve(obj,
+						nrows, max_nrows, start_row,
+						num_dense_rows,
+						ncols, max_ncols, start_col,
+						cols, &deps_found);
+				if (deps_found)
+					dump_dependencies(obj, dependencies,
+							max_ncols);
+				free(dependencies);
+				free(cols);
+				goto la_done;
+			}
+		}
+#endif
+
 		dependencies = block_lanczos(obj,
 					nrows, max_nrows, start_row,
 					num_dense_rows,
@@ -1217,5 +1251,13 @@ void nfs_solve_linear_system(msieve_obj *obj, mpz_t n) {
 	MPI_TRY(MPI_Comm_free(&obj->mpi_la_col_grid))
 #endif
 	cpu_time = time(NULL) - cpu_time;
-	logprintf(obj, "BLanczosTime: %u\n", (uint32)cpu_time);
+	logprintf(obj, "%s: %u\n", bw_used ? "BWTime" : "BLanczosTime",
+			(uint32)cpu_time);
+	return;
+
+#ifdef HAVE_BW
+la_done:
+	cpu_time = time(NULL) - cpu_time;
+	logprintf(obj, "BWTime: %u\n", (uint32)cpu_time);
+#endif
 }

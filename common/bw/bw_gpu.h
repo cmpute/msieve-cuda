@@ -50,7 +50,12 @@ struct bw_worker {
 	uint64_t *d_y0;          /* Y0 replica, full N words */
 	uint64_t *d_u;           /* U masks for this slab:
 				    (m/64) words per coordinate row */
+	uint64_t *d_u_dense;    /* U masks for slab 0's dense-row prefix
+				    [0,row_min), same layout */
 	uint64_t *d_s;           /* partial S, m words */
+	uint64_t *d_fcoef;       /* mksol coefficient, n words (the host
+				    pointer cannot be dereferenced on the
+				    device, so it is staged here first) */
 	uint64_t *d_hist[BW_HIST_DEPTH + 1];  /* [0,BW_HIST_DEPTH) are the
 				    circular-history slabs, [BW_HIST_DEPTH]
 				    is a one-word zero flag */

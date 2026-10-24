@@ -38,6 +38,10 @@ static uint64_t bw_extract_block(la_col_t *cols,
 	entry_idx_t *entries = *entries_in;
 	uint64_t max_entries = *max_entries_in;
 
+	if (entries == NULL)      /* first block of the slab */
+		entries = (entry_idx_t *)xmalloc(
+				max_entries * sizeof(entry_idx_t));
+
 	for (i = col_min; (i < col_max) && (num_entries < nnz); i++) {
 
 		la_col_t *col = cols + i;
@@ -188,7 +192,7 @@ static int bw_pack_block(bw_csrblock_t *b,
 }
 
 /*-------------------------------------------------------------------*/
-#define BW_BAND_SHIFT 12   /* 4096-row bands for the nnz histogram */
+#define BW_BAND_SHIFT 12   /* band granularity cap: 4096 rows */
 
 static int bw_choose_slabs(bw_matrix_t *M, la_col_t *cols,
 			uint32_t num_slabs, uint32_t *bounds)
@@ -196,13 +200,22 @@ static int bw_choose_slabs(bw_matrix_t *M, la_col_t *cols,
 	/* balance the P row slabs by nonzero count: one pass over cols
 	   builds a per-band histogram, then greedy boundaries pick the
 	   cut points with equal nnz above num_dense_rows (dense rows go
-	   to slab 0's sparse CSR start, per the design) */
+	   to slab 0's sparse CSR start, per the design). The band size
+	   adapts down for small matrices so P distinct cuts always
+	   exist; the fallback balances raw row counts. */
 
-	uint32_t nbands = (M->nrows + (1 << BW_BAND_SHIFT) - 1) >> BW_BAND_SHIFT;
-	uint64_t *band_nnz = (uint64_t *)xcalloc(nbands, sizeof(uint64_t));
-	uint32_t i, j, b;
+	uint32_t shift = BW_BAND_SHIFT;
+	uint32_t nbands, b;
+	uint64_t *band_nnz;
+	uint32_t i, j;
 	uint64_t total = 0, accum = 0, target;
 	int s;
+
+	while ((M->nrows >> shift) < 16u * num_slabs && shift > 3)
+		shift--;
+
+	nbands = (M->nrows + ((uint32_t)1 << shift) - 1) >> shift;
+	band_nnz = (uint64_t *)xcalloc(nbands, sizeof(uint64_t));
 
 	for (i = 0; i < M->ncols; i++) {
 		la_col_t *col = cols + i;
@@ -210,39 +223,46 @@ static int bw_choose_slabs(bw_matrix_t *M, la_col_t *cols,
 			uint32_t idx = col->data[j];
 			if (idx < M->num_dense_rows)
 				continue;      /* dense rows not in slabs */
-			band_nnz[idx >> BW_BAND_SHIFT]++;
+			band_nnz[idx >> shift]++;
 			total++;
 		}
 	}
 
 	M->sparse_weight = total;
 
-	bounds[0] = M->num_dense_rows;   /* sparse CSR of slab 0 starts
-					  above the packed dense rows */
+	bounds[0] = M->num_dense_rows;
+	bounds[num_slabs] = M->nrows;
+
 	s = 1;
 	accum = 0;
 	target = total / num_slabs;
-	for (b = 0; b < nbands; b++) {
+	for (b = 0; b < nbands && s < (int)num_slabs; b++) {
 		accum += band_nnz[b];
-		if (s < (int)num_slabs &&
-		    accum >= (uint64_t)s * target &&
-		    ((b + 1) << BW_BAND_SHIFT) > M->num_dense_rows) {
-			uint32_t cut = (b + 1) << BW_BAND_SHIFT;
+		if (accum >= (uint64_t)s * target &&
+		    ((b + 1) << shift) > M->num_dense_rows) {
+			uint32_t cut = (b + 1) << shift;
 			if (cut > M->nrows)
 				cut = M->nrows;
-			bounds[s++] = cut;
+			if (cut > bounds[s-1])
+				bounds[s++] = cut;
 		}
 	}
-	while (s < (int)num_slabs)      /* degenerate tails */
-		bounds[s++] = M->nrows;
-	bounds[num_slabs] = M->nrows;
 
-	/* de-duplicate in the (pathological) equal-bounds case */
-	for (s = 1; s < (int)num_slabs; s++)
+	/* fallback: fill any remaining cuts by equal row counts */
+	while (s < (int)num_slabs) {
+		uint64_t span = (uint64_t)M->nrows - bounds[s-1];
+		uint32_t need = num_slabs - s;
+		uint32_t cut = bounds[s-1] + (uint32_t)((span + need - 1) / need);
+		if (cut >= M->nrows)
+			cut = M->nrows - 1;
+		if (cut <= bounds[s-1])
+			cut = bounds[s-1] + 1;
+		bounds[s++] = cut;
+	}
+
+	for (s = 1; s <= (int)num_slabs; s++)
 		if (bounds[s] <= bounds[s-1])
-			bounds[s] = bounds[s-1] + 1;
-	if (bounds[num_slabs] <= bounds[num_slabs-1])
-		return -1;
+			return -1;
 
 	free(band_nnz);
 	return 0;
@@ -356,6 +376,7 @@ int bw_matrix_build(bw_matrix_t *M, msieve_obj *obj,
 
 		slab->row_min = row_min;
 		slab->row_max = row_max;
+		slab->xfer_min = (s == 0) ? 0 : row_min;
 
 		/* count slab nnz to size the extraction target */
 		{

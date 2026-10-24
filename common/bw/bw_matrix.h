@@ -26,6 +26,9 @@ typedef struct {
 typedef struct {
 	uint32_t row_min;       /* absolute row range of the slab */
 	uint32_t row_max;
+	uint32_t xfer_min;      /* state exchange window start: 0 for
+				   slab 0 (its dense rows [0,num_dense_rows)
+				   are real state), row_min otherwise */
 	bw_csrblock_t *blocks;
 	uint32_t num_blocks;
 	uint64_t total_nnz;

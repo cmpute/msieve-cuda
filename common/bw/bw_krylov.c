@@ -188,8 +188,8 @@ static int krylov_checkpoint(bw_group_t *g, msieve_obj *obj,
 		}
 	for (w = 0; w < g->num_workers; w++) {
 		bw_slab_t *slab = g->M->slabs + w;
-		memcpy(scratch + slab->row_min, g->w[w].h_stage,
-			(size_t)(slab->row_max - slab->row_min) * 8);
+		memcpy(scratch + slab->xfer_min, g->w[w].h_stage,
+			(size_t)(slab->row_max - slab->xfer_min) * 8);
 	}
 
 	h = bw_fnv1a(0, scratch, (size_t)g->N * 8);

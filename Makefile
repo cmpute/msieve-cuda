@@ -287,6 +287,92 @@ endif
 
 #---------------------------------- NFS file lists -------------------------
 
+#---------------------------------- BW file lists -------------------------
+# Block Wiedemann, opt-in via BW=1. Requires CUDA, VBITS=64,
+# CUDA_SINGLE_BINARY=1 and no MPI. BW=0 (default) leaves every
+# existing build byte-for-byte identical: the BW sources are not
+# compiled and nothing below changes the object lists.
+
+BW_C_SRCS = \
+	common/bw/bw.c \
+	common/bw/bw_matrix.c \
+	common/bw/bw_checkpoint.c \
+	common/bw/bw_gpu.c \
+	common/bw/bw_krylov.c \
+	common/bw/bw_mksol.c
+
+BW_OBJS = $(BW_C_SRCS:.c=.bwo)
+BW_KERNEL_OBJ = common/bw/bw_kernel.o
+BW_LINGEN_OBJ = common/bw/bw_lingen.bwx
+
+ifeq ($(BW),1)
+ifndef CUDA
+$(error BW=1 requires CUDA (pass CUDA=1 or CUDA=<arch>))
+endif
+ifneq ($(VBITS),64)
+$(error BW=1 requires VBITS=64)
+endif
+ifneq ($(CUDA_SINGLE_BINARY),1)
+$(error BW=1 requires CUDA_SINGLE_BINARY=1)
+endif
+ifeq ($(MPI),1)
+$(error BW=1 cannot be combined with MPI)
+endif
+
+CFLAGS += -DHAVE_BW -Icommon/bw
+
+# the CUDA 13 headers emit v4 driver-API symbols that only the
+# forward-compat libcuda carries on this driver; harmless elsewhere
+LIBS += -L"$(CUDA_ROOT)/compat/lib"
+
+# the LGPL gf2x variant (default) builds with the placeholder Toom
+# code; BW_GPL_GF2X=1 keeps the faster GPL-3.0 file instead
+GF2X_DIR = common/bw/gf2x
+GF2X_LIB = $(GF2X_DIR)/.libs/libgf2x.a
+GF2X_STAMP = $(GF2X_DIR)/bw-stamp-configured
+
+BW_CXXFLAGS = -O2 -g -std=c++14 -fopenmp \
+	-DLINGEN_BINARY -DBW_NO_MPI \
+	-Icommon/bw -Icommon/bw/cado -Icommon/bw/cado/bwc \
+	-Icommon/bw/cado/bblas -Icommon/bw/cado/utils \
+	-Icommon/bw/cado/utils/embedded -Icommon/bw/shims \
+	-I$(GF2X_DIR) \
+	-I"$(CUDA_ROOT)/include"
+
+# the rule block below must not become the default goal
+.DEFAULT_GOAL := all
+
+$(GF2X_STAMP):
+	cd $(GF2X_DIR) && \
+	(if [ "$(BW_GPL_GF2X)" != "1" ]; then \
+		cp -f toom-gpl-placeholder.c toom-gpl.c; \
+	fi) && \
+	./configure --disable-shared
+	touch $@
+
+$(GF2X_LIB): $(GF2X_STAMP)
+	cd $(GF2X_DIR) && $(MAKE) libgf2x.la
+
+$(BW_OBJS): %.bwo: %.c $(COMMON_HDR)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+common/bw/bw_lingen.bwx: common/bw/bw_lingen.cpp
+	$(CXX) $(BW_CXXFLAGS) -c -o $@ $<
+
+bw_test: common/bw/bw_selftest.bwo $(BW_OBJS) $(BW_KERNEL_OBJ) \
+		$(BW_LINGEN_OBJ) $(GF2X_LIB) libmsieve.a
+	$(CXX) $(CFLAGS) -o $@ common/bw/bw_selftest.bwo $(BW_OBJS) \
+		$(BW_KERNEL_OBJ) $(BW_LINGEN_OBJ) $(GF2X_LIB) \
+		libmsieve.a $(LIBS)
+
+common/bw/bw_selftest.bwo: common/bw/bw_selftest.c $(COMMON_HDR)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+BW_ALL = $(BW_OBJS) $(BW_KERNEL_OBJ) $(BW_LINGEN_OBJ)
+endif
+
+#---------------------------------- NFS file lists -------------------------
+
 NFS_HDR = \
 	gnfs/filter/filter.h \
 	gnfs/filter/hash64.h \
@@ -382,18 +468,24 @@ help:
 	@echo "add 'VBITS=X' for linear algebra with X-bit vectors"
 	@echo "     (64, 128, 192, 256, 320, 384, 448, 512)"
 
-all: demo.o $(COMMON_OBJS) $(QS_OBJS) $(NFS_OBJS) $(GPU_OBJS)
+all: demo.o $(COMMON_OBJS) $(QS_OBJS) $(NFS_OBJS) $(GPU_OBJS) $(BW_ALL) $(GF2X_LIB)
 	rm -f libmsieve.a
-	ar r libmsieve.a $(COMMON_OBJS) $(QS_OBJS) $(NFS_OBJS) $(CUDA_ARCHIVE_OBJS)
+	ar r libmsieve.a $(COMMON_OBJS) $(QS_OBJS) $(NFS_OBJS) $(CUDA_ARCHIVE_OBJS) $(BW_OBJS) $(BW_KERNEL_OBJ) $(BW_LINGEN_OBJ)
 	ranlib libmsieve.a
-	$(LINKER) $(CFLAGS) -o msieve $(LDFLAGS) demo.o libmsieve.a $(LIBS)
+	$(LINKER) $(CFLAGS) -o msieve $(LDFLAGS) demo.o libmsieve.a $(LIBS) $(GF2X_LIB)
 
 clean:
 	cd cub && make clean WIN=$(WIN) WIN64=$(WIN64) && cd ..
 	rm -f msieve msieve.exe demo.o libmsieve.a $(COMMON_OBJS) $(QS_OBJS) \
 		$(COMMON_GPU_OBJS) $(NFS_OBJS) $(NFS_GPU_OBJS) $(NFS_NOGPU_OBJS) \
 		$(CUDA_ENGINE_OBJS) $(CUDA_EMBED_OBJS) *.ptx *.fatbin *_embed.c \
+		common/bw/*.bwo common/bw/*.bwx common/bw/bw_kernel.o bw_test \
 		msieve_bin2c msieve_bin2c.exe
+	if [ -f common/bw/gf2x/Makefile ]; then \
+		cd common/bw/gf2x && $(MAKE) distclean || true; \
+		cd ../../..; \
+	fi
+	rm -f common/bw/gf2x/bw-stamp-configured
 
 #----------------------------------------- build rules ----------------------
 
@@ -453,6 +545,10 @@ cub/sort_engine.o: cub/sort_engine.cu cub/sort_engine.h $(CUB_DEPS)
 cub/spmv_engine.o: cub/spmv_engine.cu cub/spmv_engine.h $(CUB_DEPS)
 	$(NVCC) $(CUDA_FATBIN_GENCODE) $(CUDA_HOST_FLAGS) -O3 -DVBITS=$(VBITS) \
 		-I. -Icub -I"$(CUDA_ROOT)/include" -c -o $@ $<
+
+common/bw/bw_kernel.o: common/bw/bw_kernel.cu
+	$(NVCC) $(CUDA_FATBIN_GENCODE) $(CUDA_HOST_FLAGS) -O3 -DVBITS=$(VBITS) \
+		-I. -Icub -Icommon/bw -I"$(CUDA_ROOT)/include" -c -o $@ $<
 
 $(BIN2C): tools/bin2c.c
 	$(HOSTCC) -O2 -o $@ $<

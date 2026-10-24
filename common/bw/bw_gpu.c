@@ -15,6 +15,7 @@ host memory and barriers.
 #include "bw.h"
 
 #include <cuda_runtime.h>
+#include <stdio.h>
 
 /* single-binary CUDA build: the engine objects are linked in, same
    declaration style as lanczos_matmul_gpu.c */
@@ -47,8 +48,13 @@ static void worker_step_spmv(bw_worker_t *w)
 	uint64_t *xout = w->d_x[g->cur ^ 1];
 	uint32_t i;
 
-	CUDA_CHK(w, cudaMemsetAsync(xout + slab->row_min, 0,
-			(size_t)(slab->row_max - slab->row_min) * 8,
+	/* slab 0's sparse CSR starts at num_dense_rows, but its output
+	   range still begins at row 0: the dense kernel accumulates
+	   there, so the whole slab range must be zeroed */
+	CUDA_CHK(w, cudaMemsetAsync(xout + (w->idx == 0 ? 0 :
+						slab->row_min), 0,
+			(size_t)(slab->row_max - (w->idx == 0 ? 0 :
+						slab->row_min)) * 8,
 			w->compute));
 	CUDA_CHK(w, cudaMemsetAsync(xout + M->nrows, 0,
 			(size_t)(g->N - M->nrows) * 8,
@@ -88,18 +94,19 @@ static void worker_allgather(bw_worker_t *w, int need_mid_barrier)
 			if (j == w->idx)
 				continue;
 			CUDA_CHK(w, cudaMemcpyPeerAsync(
-				w->g->w[j].d_x[g->cur ^ 1] + slab->row_min,
+				w->g->w[j].d_x[g->cur ^ 1] + slab->xfer_min,
 				g->w[j].dev,
-				xout + slab->row_min, w->dev,
-				(size_t)(slab->row_max - slab->row_min) * 8,
+				xout + slab->xfer_min, w->dev,
+				(size_t)(slab->row_max -
+					slab->xfer_min) * 8,
 				w->copy));
 		}
 		CUDA_CHK(w, cudaStreamSynchronize(w->copy));
 		return;
 	}
 
-	CUDA_CHK(w, cudaMemcpyAsync(w->h_stage, xout + slab->row_min,
-			(size_t)(slab->row_max - slab->row_min) * 8,
+	CUDA_CHK(w, cudaMemcpyAsync(w->h_stage, xout + slab->xfer_min,
+			(size_t)(slab->row_max - slab->xfer_min) * 8,
 			cudaMemcpyDeviceToHost, w->copy));
 	CUDA_CHK(w, cudaStreamSynchronize(w->copy));
 
@@ -110,8 +117,9 @@ static void worker_allgather(bw_worker_t *w, int need_mid_barrier)
 		if (j == w->idx)
 			continue;
 		CUDA_CHK(w, cudaMemcpyAsync(
-			xout + M->slabs[j].row_min, o->h_stage,
-			(size_t)(M->slabs[j].row_max - M->slabs[j].row_min) * 8,
+			xout + M->slabs[j].xfer_min, o->h_stage,
+			(size_t)(M->slabs[j].row_max -
+				M->slabs[j].xfer_min) * 8,
 			cudaMemcpyHostToDevice, w->copy));
 	}
 	CUDA_CHK(w, cudaStreamSynchronize(w->copy));
@@ -128,9 +136,22 @@ static void worker_do_step(bw_worker_t *w)
 	worker_step_spmv(w);
 
 	if (g->cmd == BW_CMD_KRYLOV_STEP) {
+		/* the oprod kernel XOR-accumulates into s */
+		CUDA_CHK(w, cudaMemsetAsync(w->d_s, 0,
+				g->o->m * 8, w->compute));
 		bw_oprod64(w->d_s, w->d_u, xout + slab->row_min,
 				g->o->m / 64, slab->row_max - slab->row_min,
 				w->compute);
+		/* rows [0,num_dense_rows) have no U coverage: the U block
+		   is m x nrows but the dense rows are part of nrows, so
+		   the oprod above misses them. The dense rows are genuine
+		   state and must feed S too: run the oprod over the dense
+		   prefix with the corresponding U words. */
+		if (w->idx == 0 && slab->row_min > 0)
+			bw_oprod64(w->d_s, w->d_u_dense,
+					xout,
+					g->o->m / 64, slab->row_min,
+					w->compute);
 		CUDA_CHK(w, cudaEventRecord(w->ev_comp, w->compute));
 		CUDA_CHK(w, cudaStreamWaitEvent(w->copy, w->ev_comp, 0));
 		CUDA_CHK(w, cudaMemcpyAsync(w->h_s, w->d_s,
@@ -138,17 +159,22 @@ static void worker_do_step(bw_worker_t *w)
 				cudaMemcpyDeviceToHost, w->copy));
 	}
 	else if (g->cmd == BW_CMD_MKSOL_STEP) {
-		bw_combine64(xout, w->d_y0, g->fcoef, g->N, w->compute);
+		CUDA_CHK(w, cudaMemcpyAsync(w->d_fcoef, g->fcoef,
+				g->o->n * 8, cudaMemcpyHostToDevice,
+				w->compute));
+		bw_combine64(xout, w->d_y0, w->d_fcoef, g->N,
+				w->compute);
 		CUDA_CHK(w, cudaEventRecord(w->ev_comp, w->compute));
 	}
 	else {	/* BW_CMD_NIL_STEP */
-		bw_anyset64(xout + slab->row_min, w->d_hist[BW_HIST_DEPTH],
-				slab->row_max - slab->row_min, w->compute);
+		bw_anyset64(xout + slab->xfer_min,
+				w->d_hist[BW_HIST_DEPTH],
+				slab->row_max - slab->xfer_min, w->compute);
 		/* remember the predecessor while it is still x[cur] */
 		CUDA_CHK(w, cudaMemcpyAsync(
 			w->d_hist[g->hist_ptr % BW_HIST_DEPTH],
-			w->d_x[g->cur] + slab->row_min,
-			(size_t)(slab->row_max - slab->row_min) * 8,
+			w->d_x[g->cur] + slab->xfer_min,
+			(size_t)(slab->row_max - slab->xfer_min) * 8,
 			cudaMemcpyDeviceToDevice, w->compute));
 		CUDA_CHK(w, cudaEventRecord(w->ev_comp, w->compute));
 		CUDA_CHK(w, cudaStreamWaitEvent(w->copy, w->ev_comp, 0));
@@ -169,7 +195,7 @@ static int worker_alloc_and_upload(bw_worker_t *w)
 	bw_slab_t *slab = M->slabs + w->idx;
 	uint32_t words_per_row = g->o->m / 64;
 	uint32_t i;
-	size_t slab_words = slab->row_max - slab->row_min;
+	size_t slab_words = slab->row_max - slab->xfer_min;
 
 	/* CSR blocks */
 	w->sd = (spmv_data_t *)xcalloc(slab->num_blocks,
@@ -206,6 +232,7 @@ static int worker_alloc_and_upload(bw_worker_t *w)
 	CUDA_CHK(w, cudaMalloc((void **)&w->d_u,
 			(size_t)slab_words * words_per_row * 8));
 	CUDA_CHK(w, cudaMalloc((void **)&w->d_s, g->o->m * 8));
+	CUDA_CHK(w, cudaMalloc((void **)&w->d_fcoef, g->o->n * 8));
 	CUDA_CHK(w, cudaMalloc((void **)&w->d_hist[BW_HIST_DEPTH], 8));
 	for (i = 0; i < BW_HIST_DEPTH; i++)
 		CUDA_CHK(w, cudaMalloc((void **)&w->d_hist[i],
@@ -230,8 +257,19 @@ static int worker_alloc_and_upload(bw_worker_t *w)
 			(size_t)g->N * 8, cudaMemcpyHostToDevice));
 	CUDA_CHK(w, cudaMemcpy(w->d_u,
 			g->h_u + (size_t)slab->row_min * words_per_row,
-			(size_t)slab_words * words_per_row * 8,
+			(size_t)(slab->row_max - slab->row_min) *
+				words_per_row * 8,
 			cudaMemcpyHostToDevice));
+	/* U words for the dense-row prefix of slab 0 (rows
+	   [0,row_min)) sit BEFORE the main slab upload; give them
+	   their own device buffer so the prefix oprod can read them */
+	if (slab->row_min > 0) {
+		CUDA_CHK(w, cudaMalloc((void **)&w->d_u_dense,
+				(size_t)slab->row_min * words_per_row * 8));
+		CUDA_CHK(w, cudaMemcpy(w->d_u_dense, g->h_u,
+				(size_t)slab->row_min * words_per_row * 8,
+				cudaMemcpyHostToDevice));
+	}
 
 	return w->cuda_error ? -1 : 0;
 }
@@ -261,7 +299,9 @@ static void worker_free(bw_worker_t *w)
 	if (w->d_x[1]) cudaFree(w->d_x[1]);
 	if (w->d_y0) cudaFree(w->d_y0);
 	if (w->d_u) cudaFree(w->d_u);
+	if (w->d_u_dense) cudaFree(w->d_u_dense);
 	if (w->d_s) cudaFree(w->d_s);
+	if (w->d_fcoef) cudaFree(w->d_fcoef);
 	if (w->d_dense) cudaFree(w->d_dense);
 	for (i = 0; i <= BW_HIST_DEPTH; i++)  /* includes the flag slot */
 		if (w->d_hist[i]) cudaFree(w->d_hist[i]);
@@ -301,12 +341,13 @@ static void *worker_main(void *arg)
 	}
 
 	while (1) {
+		int stop;
+
 		pthread_barrier_wait(&g->b_start);
 
-		if (g->cmd == BW_CMD_STOP)
-			break;
+		stop = (g->cmd == BW_CMD_STOP);
 
-		if (w->cuda_error)     /* keep barrier count balanced */
+		if (!stop && w->cuda_error)  /* keep barrier count balanced */
 			goto end_of_step;
 
 		switch (g->cmd) {
@@ -347,9 +388,9 @@ static void *worker_main(void *arg)
 			{
 				bw_slab_t *slab = g->M->slabs + w->idx;
 				CUDA_CHK(w, cudaMemcpy(w->h_stage,
-					w->d_x[g->cur] + slab->row_min,
+					w->d_x[g->cur] + slab->xfer_min,
 					(size_t)(slab->row_max -
-						slab->row_min) * 8,
+						slab->xfer_min) * 8,
 					cudaMemcpyDeviceToHost));
 			}
 			break;
@@ -360,6 +401,8 @@ static void *worker_main(void *arg)
 
 end_of_step:
 		pthread_barrier_wait(&g->b_end);
+		if (stop)
+			break;
 	}
 
 	worker_free(w);
@@ -385,8 +428,9 @@ int bw_gpu_start(bw_group_t *g, bw_matrix_t *M, const bw_opts_t *o,
 	/* worker 0 needs the slabs in order before startup; the matrix
 	   packer already ordered slabs to match the gpu list */
 	for (i = 0; i < g->num_workers; i++) {
-		g->slab_words[i] = Mx->slabs[i].row_max - Mx->slabs[i].row_min;
-		g->slab_off[i] = Mx->slabs[i].row_min;
+		g->slab_words[i] = Mx->slabs[i].row_max -
+					Mx->slabs[i].xfer_min;
+		g->slab_off[i] = Mx->slabs[i].xfer_min;
 	}
 
 	g->w = (bw_worker_t *)xcalloc(g->num_workers, sizeof(bw_worker_t));

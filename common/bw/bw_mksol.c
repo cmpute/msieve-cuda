@@ -150,8 +150,9 @@ int bw_run_mksol(bw_group_t *g, msieve_obj *obj, const bw_opts_t *o,
 			}
 		for (w = 0; w < g->num_workers; w++) {
 			bw_slab_t *slab = g->M->slabs + w;
-			memcpy(deps_out + slab->row_min, g->w[w].h_stage,
-				(size_t)(slab->row_max - slab->row_min) * 8);
+			memcpy(deps_out + slab->xfer_min, g->w[w].h_stage,
+				(size_t)(slab->row_max -
+					slab->xfer_min) * 8);
 		}
 	}
 

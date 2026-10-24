@@ -31,41 +31,55 @@ __global__ void bw_oprod64_kernel(ull_t *s,
 			const ull_t *u, const ull_t *y,
 			uint32_t nmasks, uint32_t nrows)
 {
-	extern __shared__ ull_t sh[];    /* nmasks*64 words */
-	uint32_t i;
-	uint32_t tid = threadIdx.x;
+	/* warp per row, lane per pair of U rows: lane l accumulates
+	   S[64k+l] and S[64k+l+32], so every shared write goes to a
+	   lane-private word (plain ^= would race across lanes) */
+	extern __shared__ ull_t sh[];    /* warps * nmasks * 64 words */
+	const uint32_t warps = blockDim.x / 32u;
+	const uint32_t wid = threadIdx.x / 32u;
+	const uint32_t lane = threadIdx.x % 32u;
+	const uint32_t gwarp = blockIdx.x * warps + wid;
+	ull_t *mine = sh + (size_t)wid * nmasks * 64;
+	uint32_t t;
 
-	for (i = tid; i < nmasks * 64; i += blockDim.x)
-		sh[i] = 0;
+	for (t = threadIdx.x; t < warps * nmasks * 64; t += blockDim.x)
+		sh[t] = 0;
 	__syncthreads();
 
-	for (i = blockIdx.x * blockDim.x + tid; i < nrows;
-			i += (uint32_t)gridDim.x * blockDim.x) {
-		ull_t yy = y[i];
-		uint32_t k;
+	for (uint32_t row = gwarp; row < nrows;
+			row += (uint32_t)gridDim.x * warps) {
+		ull_t yy = y[row];
 		if (!yy)
 			continue;
-		for (k = 0; k < nmasks; k++) {
-			ull_t uu = u[(size_t)i * nmasks + k];
-			while (uu) {
-				uint32_t a = (uint32_t)__ffsll((long long)uu) - 1;
-				sh[64 * k + a] ^= yy;
-				uu &= uu - 1;
-			}
+		for (uint32_t k = 0; k < nmasks; k++) {
+			ull_t uu = u[(size_t)row * nmasks + k];
+			if ((uu >> lane) & 1u)
+				mine[64 * k + lane] ^= yy;
+			if ((uu >> (lane + 32)) & 1u)
+				mine[64 * k + lane + 32] ^= yy;
 		}
 	}
 	__syncthreads();
 
-	/* few blocks; atomics on nmasks*64 words are cheap */
-	for (i = tid; i < nmasks * 64; i += blockDim.x)
-		atomicXor(&s[i], sh[i]);
+	/* few blocks; atomics on nmasks*64 words are cheap. Only warp
+	   0 flushes: every warp computed the same cross-warp XOR, so
+	   flushing from all of them would cancel to zero */
+	if (wid == 0)
+		for (t = lane; t < nmasks * 64; t += 32u) {
+			ull_t acc = 0;
+			for (uint32_t w = 0; w < warps; w++)
+				acc ^= sh[(size_t)w * nmasks * 64 + t];
+			if (acc)
+				atomicXor(&s[t], acc);
+		}
 }
 
 extern "C" void bw_oprod64(ull_t *s, const ull_t *u,
 			const ull_t *y, uint32_t nmasks, size_t nrows,
 			cudaStream_t stream)
 {
-	size_t shbytes = (size_t)nmasks * 64 * sizeof(ull_t);
+	size_t shbytes = (size_t)(BW_THREADS / 32) * nmasks * 64 *
+			sizeof(ull_t);
 	int blocks = (int)((nrows + BW_THREADS - 1) / BW_THREADS);
 	if (blocks > 4096)
 		blocks = 4096;
@@ -125,40 +139,67 @@ get x[c] XORed in shared memory, flushed with one atomic per word.
 __global__ void bw_dense64_kernel(ull_t *y, const ull_t *dense,
 			const ull_t *x, uint32_t ndb, size_t n)
 {
-	extern __shared__ ull_t sh[];    /* ndb*64 words */
-	uint32_t tid = threadIdx.x;
-	size_t j;
-	uint32_t k;
+	/* warp sweeps groups of 32 columns; lane l accumulates dense
+	   rows l and l+32 of every 64-row block, reading the column's
+	   bitmap word and state word as a warp broadcast. Shared writes
+	   are lane-private (plain ^= would race across lanes). */
+	extern __shared__ ull_t sh[];    /* warps * ndb * 64 words */
+	const uint32_t warps = blockDim.x / 32u;
+	const uint32_t wid = threadIdx.x / 32u;
+	const uint32_t lane = threadIdx.x % 32u;
+	const uint32_t gwarp = blockIdx.x * warps + wid;
+	ull_t *mine = sh + (size_t)wid * ndb * 64;
+	uint32_t t;
 
-	for (uint32_t i = tid; i < ndb * 64; i += blockDim.x)
-		sh[i] = 0;
+	for (t = threadIdx.x; t < warps * ndb * 64; t += blockDim.x)
+		sh[t] = 0;
 	__syncthreads();
 
-	for (j = (size_t)blockIdx.x * blockDim.x + tid; j < n;
-			j += (size_t)gridDim.x * blockDim.x) {
-		ull_t xx = x[j];
-		if (!xx)
-			continue;
-		for (k = 0; k < ndb; k++) {
-			ull_t dd = dense[(size_t)k * n + j];
-			while (dd) {
-				uint32_t r = (uint32_t)__ffsll((long long)dd) - 1;
-				sh[64 * k + r] ^= xx;
-				dd &= dd - 1;
+	const uint32_t ngroups = (uint32_t)((n + 31) / 32);
+	for (uint32_t g = gwarp; g < ngroups;
+			g += (uint32_t)gridDim.x * warps) {
+		size_t base = (size_t)g * 32;
+		for (uint32_t k = 0; k < ndb; k++) {
+			ull_t acc0 = 0, acc1 = 0;
+			for (uint32_t c = 0; c < 32; c++) {
+				size_t j = base + c;
+				if (j >= n)
+					break;
+				ull_t dd = dense[(size_t)k * n + j];
+				if (!dd)
+					continue;
+				ull_t xx = x[j];
+				if (!xx)
+					continue;
+				if ((dd >> lane) & 1u)
+					acc0 ^= xx;
+				if ((dd >> (lane + 32)) & 1u)
+					acc1 ^= xx;
 			}
+			if (acc0)
+				mine[64 * k + lane] ^= acc0;
+			if (acc1)
+				mine[64 * k + lane + 32] ^= acc1;
 		}
 	}
 	__syncthreads();
 
-	for (uint32_t i = tid; i < ndb * 64; i += blockDim.x)
-		atomicXor(&y[i], sh[i]);
+	if (wid == 0)
+		for (t = lane; t < ndb * 64; t += 32u) {
+			ull_t acc = 0;
+			for (uint32_t w = 0; w < warps; w++)
+				acc ^= sh[(size_t)w * ndb * 64 + t];
+			if (acc)
+				atomicXor(&y[t], acc);
+		}
 }
 
 extern "C" void bw_dense64(ull_t *y, const ull_t *dense,
 			const ull_t *x, uint32_t ndb, size_t n,
 			cudaStream_t stream)
 {
-	size_t shbytes = (size_t)ndb * 64 * sizeof(ull_t);
+	size_t shbytes = (size_t)(BW_THREADS / 32) * ndb * 64 *
+			sizeof(ull_t);
 	int blocks = (int)((n + BW_THREADS - 1) / BW_THREADS);
 	if (blocks > 4096)
 		blocks = 4096;
@@ -226,7 +267,8 @@ extern "C" int bw_preflight(int dev)
 		int sm = 1;
 		cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, dev);
 		e = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks,
-			bw_oprod64_kernel, BW_THREADS, 8 * 64 * sizeof(ull_t));
+			bw_oprod64_kernel, BW_THREADS,
+			(BW_THREADS / 32) * 8 * 64 * sizeof(ull_t));
 		if (e != cudaSuccess || blocks <= 0 || sm <= 0) {
 			printf("BW preflight: bw_oprod64 occupancy failed\n");
 			return -1;
@@ -238,7 +280,8 @@ extern "C" int bw_preflight(int dev)
 			return -1;
 		}
 		e = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks,
-			bw_dense64_kernel, BW_THREADS, 64 * sizeof(ull_t));
+			bw_dense64_kernel, BW_THREADS,
+			(BW_THREADS / 32) * 64 * sizeof(ull_t));
 		if (e != cudaSuccess || blocks <= 0) {
 			printf("BW preflight: bw_dense64 occupancy failed\n");
 			return -1;
