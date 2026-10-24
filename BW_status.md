@@ -161,6 +161,25 @@ gnfs/gf2.c (the only HAVE_BW-dependent TU) when switching back.
 Also `make msieve` is a no-op (msieve is not a real target; the
 default goal builds it).
 
+## CADO removed; own+gf2x is the default lingen (2026-10-24, night)
+
+User decision: keep gf2x, drop CADO entirely. The vendored
+common/bw/cado/ tree and shims/ are deleted (history in git);
+bw_gfpoly.c (our Karatsuba) went with it -- bw_lingen_own.cpp now
+multiplies through gf2x (gf2x_mul_r with per-thread pools). The
+bw_lingen_impl values collapsed to 0 = own (default) / 1 = quad;
+tests default to own on device 1.
+
+Effect on the RSA-100 matrix (3 GPUs): lingen 93 s (our Karatsuba)
+-> 22 s (gf2x) -- 3.1x faster than the removed cado path (69 s) and
+the fastest of the three. Whole -nc2 now 37 s wall (Krylov 6 +
+lingen 22 + mksol 3 + verify); 47 CPU-verified dependencies; sqrt
+reproduces the published factors. Identity tests (m=64/128), both
+closed-loop selftests (own default, quad) green after the removal.
+
+Remaining LGPL-2.1+ surface: gf2x only (LGPL build by default, the
+GPL Toom file swapped for the placeholder; BW_GPL_GF2X=1 opts in).
+
 ## Open (next session)
 
 - multi-GPU scaling table on this matrix (1 vs 2 vs 3 GPUs).

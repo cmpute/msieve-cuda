@@ -2,10 +2,12 @@ Licensing map for common/bw/
 ============================
 
 msieve proper is public domain. The Block Wiedemann implementation under
-common/bw/ mixes public-domain new code with vendored LGPL-2.1+ files.
-Every vendored file keeps its original copyright and license header
-untouched. This file maps origin and license for everything vendored,
-per the day-1 provenance rules in BW.md.
+common/bw/ is new public-domain code plus ONE vendored LGPL-2.1+
+component: gf2x (the GF(2)[x] multiplication library). The CADO lingen
+files vendored earlier were REMOVED on 2026-10-24 when the independent
+recursive lingen (bw_lingen_own) replaced that path; their history
+stays in git. Every vendored file keeps its original copyright and
+license header untouched.
 
 Provenance pins (snapshot taken 2026-10-24 via `git archive`, so the
 dirty state of the live trees never leaks in):
@@ -24,26 +26,27 @@ Directory map
 -------------
 
   bw.h, bw.c, bw_matrix.*, bw_gpu.*, bw_krylov.c, bw_mksol.c,
-  bw_checkpoint.*, bw_seq.h, bw_lingen.h, bw_lingen.cpp (shim glue),
+  bw_checkpoint.*, bw_seq.h, bw_lingen.h, bw_lingen.cpp (dispatcher),
+  bw_lingen_quad.* (standalone quadratic GPU BM + shared select/
+  basecase/emit glue), bw_lingen_own.cpp (independent recursive
+  lingen: own invariants, GPU basecase, gf2x arithmetic),
   bw_kernel.cu, bw_selftest.c
         New code written for this project. Public domain, same terms
-        as the rest of msieve.
+        as the rest of msieve. The recursive lingen follows the
+        published divide-and-conquer block-BM structure (Thome); all
+        code here was written from scratch for this tree.
 
-  cado/bwc/            lingen generator, vendored from
                        cado-nfs-cognition b5ca9c4 linalg/bwc/lingen_*,
                        tree_stats.hpp. LGPL-2.1+ (cado-nfs license).
                        Edits are local and marked with `/* bw-local */`
                        comments where they occur.
 
-  cado/bblas/          GF(2) block matrix kernels (mat64/mat8/bpack and
                        the level sources the lingen base case calls),
                        vendored from b5ca9c4 linalg/bblas/. LGPL-2.1+.
 
-  cado/                submatrix_range.hpp (b5ca9c4 linalg/), macros.h
                        (b5ca9c4 root, generated header archived as-is).
                        LGPL-2.1+.
 
-  cado/utils/          gmp_aux, cxx_mpz, gmp_auxx, utils_cxx, timing,
                        misc, omp_proxy, runtime_numeric_cast, memory,
                        getprime, sha1, portability from b5ca9c4 utils/.
                        params.hpp is replaced by a stub (the original
@@ -55,7 +58,6 @@ Directory map
                        present, else
                        https://github.com/fmtlib/fmt/blob/master/LICENSE.
 
-  cado/shims/          NEW files, public domain: cado_config.h,
                        cado.h, select_mpi.h, lingen_fft_select.hpp,
                        memusage.h and the other compile-time stand-ins
                        that replace cado's build system.
@@ -79,7 +81,7 @@ static combination. We satisfy the relinking requirement by shipping
 the object files and the vendored sources alongside the binary (this
 tree), so a user can relink a modified LGPL component. For binary-only
 distribution build with BW=1 and prefer producing libmsieve_bw.so and
-dynamically linking the CADO/gf2x portions; the Makefile keeps both
+dynamically linking the gf2x portion; the Makefile keeps both
 options open.
 
 cuda-mpqs (LGPL-3.0-only) was studied for design patterns only; no

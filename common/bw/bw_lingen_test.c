@@ -148,14 +148,10 @@ int main(int argc, char **argv)
 		o.seq_len = L;
 		o.threshold = threshold;
 		o.nthreads = 4;
-		if (getenv("QUAD")) {
+		/* default (no env): own route on device 1 */
+		g_bw_lingen_dev = 1;
+		if (getenv("QUAD"))
 			g_bw_lingen_impl = 1;
-			g_bw_lingen_dev = 1;
-		}
-		if (getenv("OWNL")) {
-			g_bw_lingen_impl = 2;
-			g_bw_lingen_dev = 1;
-		}
 		if (bw_lingen_run(&o)) {
 			printf("LINGEN TEST FAIL: bw_lingen_run errored\n");
 			return 1;

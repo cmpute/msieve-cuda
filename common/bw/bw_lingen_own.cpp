@@ -39,7 +39,7 @@ buf[r*stride + c*wpc + w].
 #include <algorithm>
 
 #include "bw_lingen_quad.h"
-#include "bw_gfpoly.h"
+#include "gf2x.h"
 #include "bw_seq.h"
 
 static double own_now(void)
@@ -95,47 +95,53 @@ static void own_vecmul(std::vector<uint64_t> &out, uint64_t w0,
 
 	out.assign((size_t)b * out_len * wpc_in, 0);
 
-#pragma omp parallel for schedule(dynamic)
-	for (int64_t j1 = 0; j1 < (int64_t)b; j1++) {
-		uint32_t j = (uint32_t)j1;
-		const uint64_t *srow = &s[(size_t)j * s_len * s_wpc];
-		std::vector<uint64_t> acc((size_t)bits * full_w, 0);
-		std::vector<uint64_t> scalar((size_t)s_w), prod((size_t)full_w);
-		std::vector<uint64_t> sc(bw_gfpoly_scratch_words(
-						(uint32_t)s_w,
-						(uint32_t)in_w));
-		for (uint32_t k = 0; k < b; k++) {
-			uint32_t kw = k >> 6, kb = k & 63;
-			std::fill(scalar.begin(), scalar.end(), 0);
-			int nz = 0;
-			for (uint64_t c = 0; c < s_len; c++) {
-				if ((srow[c * s_wpc + kw] >> kb) & 1) {
-					scalar[c >> 6] |= 1ull << (c & 63);
-					nz = 1;
+#pragma omp parallel
+	{
+		/* per-thread gf2x scratch pool (reentrant variant) */
+		gf2x_mul_pool_t pool;
+		gf2x_mul_pool_init(pool);
+#pragma omp for schedule(dynamic)
+		for (int64_t j1 = 0; j1 < (int64_t)b; j1++) {
+			uint32_t j = (uint32_t)j1;
+			const uint64_t *srow = &s[(size_t)j * s_len * s_wpc];
+			std::vector<uint64_t> acc((size_t)bits * full_w, 0);
+			std::vector<uint64_t> scalar((size_t)s_w),
+					prod((size_t)full_w);
+			for (uint32_t k = 0; k < b; k++) {
+				uint32_t kw = k >> 6, kb = k & 63;
+				std::fill(scalar.begin(), scalar.end(), 0);
+				int nz = 0;
+				for (uint64_t c = 0; c < s_len; c++) {
+					if ((srow[c * s_wpc + kw] >> kb) & 1) {
+						scalar[c >> 6] |= 1ull << (c & 63);
+						nz = 1;
+					}
+				}
+				if (!nz)
+					continue;
+				for (uint32_t i = 0; i < bits; i++) {
+					gf2x_mul_r(prod.data(), scalar.data(),
+						(unsigned long)s_w,
+						&planes_buf[((size_t)k * bits + i)
+							* in_w],
+						(unsigned long)in_w, pool);
+					uint64_t *a = &acc[(size_t)i * full_w];
+					for (uint64_t i2 = 0; i2 < full_w; i2++)
+						a[i2] ^= prod[i2];
 				}
 			}
-			if (!nz)
-				continue;
+			uint64_t *orow = &out[(size_t)j * out_len * wpc_in];
 			for (uint32_t i = 0; i < bits; i++) {
-				bw_gfpoly_mul(prod.data(), scalar.data(),
-					(uint32_t)s_w,
-					&planes_buf[((size_t)k * bits + i)
-						* in_w], (uint32_t)in_w);
-				uint64_t *a = &acc[(size_t)i * full_w];
-				for (uint64_t i2 = 0; i2 < full_w; i2++)
-					a[i2] ^= prod[i2];
+				const uint64_t *a = &acc[(size_t)i * full_w];
+				for (uint64_t c = 0; c < out_len; c++) {
+					uint64_t gc = c + w0;
+					if ((a[gc >> 6] >> (gc & 63)) & 1)
+						orow[c * wpc_in + (i >> 6)] |=
+							1ull << (i & 63);
+				}
 			}
 		}
-		uint64_t *orow = &out[(size_t)j * out_len * wpc_in];
-		for (uint32_t i = 0; i < bits; i++) {
-			const uint64_t *a = &acc[(size_t)i * full_w];
-			for (uint64_t c = 0; c < out_len; c++) {
-				uint64_t gc = c + w0;
-				if ((a[gc >> 6] >> (gc & 63)) & 1)
-					orow[c * wpc_in + (i >> 6)] |=
-						1ull << (i & 63);
-			}
-		}
+		gf2x_mul_pool_clear(pool);
 	}
 }
 
