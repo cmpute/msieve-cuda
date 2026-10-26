@@ -558,9 +558,13 @@ libhandle_t load_dynamic_lib(const char *libname)
 void unload_dynamic_lib(libhandle_t h)
 {
 #if defined(WIN32) || defined(_WIN64)
-	FreeLibrary(h);
+	if (h != NULL)
+		FreeLibrary(h);
 #else
-	dlclose(h);
+	/* the single-binary build links engines statically and leaves the
+	   handle NULL; dlclose(NULL) would segfault */
+	if (h != NULL)
+		dlclose(h);
 #endif
 }
 
