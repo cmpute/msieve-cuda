@@ -616,28 +616,39 @@ void mp_rshift(mp_t *a, uint32 shift, mp_t *res) {
 	int32 start_word = shift / 32;
 	uint32 word_shift = shift & 31;
 	uint32 comp_word_shift = 32 - word_shift;
+	mp_t t;
+
+	/* most callers shift in place (res == a). Compute into a local
+	   and copy out: gcc's auto-vectorizer has been seen to overrun
+	   val[] on the overlapping forward copy, writing past the last
+	   word of the caller's stack-allocated mp_t (observed as a
+	   stack-smashing abort in form_post_lanczos_matrix, which calls
+	   this with POST_LANCZOS_ROWS = 112 at VBITS = 128) */
 
 	if (start_word > words) {
 		mp_clear(res);
 		return;
 	}
+	if (words > MAX_MP_WORDS)
+		words = MAX_MP_WORDS;
 
 	if (word_shift == 0) {
 		for (i = 0; i < (words-start_word); i++)
-			res->val[i] = a->val[start_word+i];
+			t.val[i] = a->val[start_word+i];
 	}
 	else {
 		for (i = 0; i < (words-start_word-1); i++)
-			res->val[i] = a->val[start_word+i] >> word_shift |
+			t.val[i] = a->val[start_word+i] >> word_shift |
 				a->val[start_word+i+1] << comp_word_shift;
-		res->val[i] = a->val[start_word+i] >> word_shift;
+		t.val[i] = a->val[start_word+i] >> word_shift;
 		i++;
 	}
 
 	for (; i < MAX_MP_WORDS; i++)
-		res->val[i] = 0;
+		t.val[i] = 0;
 
-	res->nwords = num_nonzero_words(res->val, (uint32)(words - start_word));
+	t.nwords = num_nonzero_words(t.val, (uint32)(words - start_word));
+	*res = t;
 }
 
 /*---------------------------------------------------------------*/
