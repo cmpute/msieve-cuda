@@ -9,7 +9,7 @@ useful. Again optionally, if you add to the functionality present here
 please consider making those additions public too, so that others may 
 benefit from your work.	
 
-$Id$
+$Id: stage2.h 732 2012-08-04 02:32:46Z jasonp_sf $
 --------------------------------------------------------------------*/
 
 #ifndef _STAGE2_H_

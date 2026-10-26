@@ -9,7 +9,7 @@ useful. Again optionally, if you add to the functionality present here
 please consider making those additions public too, so that others may 
 benefit from your work.	
 
-$Id$
+$Id: poly.c 1025 2018-08-19 02:20:28Z jasonp_sf $
 --------------------------------------------------------------------*/
 
 #include "poly.h"
@@ -138,7 +138,7 @@ int32 read_poly(msieve_obj *obj, mpz_t n,
 	mpz_mul(val, val, rat_poly->coeff[0]);
 	mpz_addmul(val, alg_poly->coeff[i], rpow);
 	mpz_neg(rat_poly->coeff[0], rat_poly->coeff[0]);
-	
+
 	if (mpz_sgn(alg_poly->coeff[alg_poly->degree]) < 0) {
 		logprintf(obj, "reversing signs of algebraic polynomial\n");
 		for (i = 0; i <= alg_poly->degree; i++)

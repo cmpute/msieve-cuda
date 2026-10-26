@@ -9,7 +9,7 @@ useful. Again optionally, if you add to the functionality present here
 please consider making those additions public too, so that others may 
 benefit from your work.	
 
-$Id$
+$Id: poly_param.c 1023 2018-08-19 00:30:42Z jasonp_sf $
 --------------------------------------------------------------------*/
 
 #include "poly_skew.h"
@@ -142,6 +142,8 @@ void get_poly_params(msieve_obj *obj, mpz_t n,
 	/* if not, choose the degree automatically */
 
 	if (degree == 0) {
+		uint32 bits = mpz_sizeinbase(n, 2);
+
 		if (digits < 108.0)
 			degree = 4;
 		else if (digits < 220.0)

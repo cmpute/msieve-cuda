@@ -9,7 +9,7 @@ useful. Again optionally, if you add to the functionality present here
 please consider making those additions public too, so that others may 
 benefit from your work.	
 
-$Id$
+$Id: root_sieve_deg6_x.c 529 2011-01-17 14:39:34Z jasonp_sf $
 --------------------------------------------------------------------*/
 
 #include "stage2.h"

@@ -22,6 +22,10 @@ extern "C" {
 	/* Lightweight factoring API */
 
 #include <util.h>
+#ifndef NO_ZLIB
+#include <zlib.h>   /* gzFile: needed even when util.h is the trunk's
+                       (ms_include/), which does not pull zlib in */
+#endif
 
 #ifdef HAVE_MPI
 #include <mpi.h>

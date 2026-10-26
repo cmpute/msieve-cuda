@@ -9,7 +9,7 @@ useful. Again optionally, if you add to the functionality present here
 please consider making those additions public too, so that others may 
 benefit from your work.	
 
-$Id$
+$Id: root_sieve_deg5_xy.c 817 2012-11-11 14:58:29Z jasonp_sf $
 --------------------------------------------------------------------*/
 
 #include "stage2.h"
@@ -246,12 +246,14 @@ sieve_xy_run_deg5(root_sieve_t *rs, uint64 lattice_size,
 	direction[0] = 1;
 	direction[1] = 0;
 	direction[2] = 0;
+
 	curr_y = gmp2int64(xy->y_base);
+
 	for (i = 0; i < y_blocks; i++) {
 		dpoly_t apoly = rs->apoly;
 
-		apoly.coeff[2] += rs->dbl_p * curr_y;
-		apoly.coeff[1] -= rs->dbl_d * curr_y;
+		apoly.coeff[2] += rs->dbl_p * (double)curr_y;
+		apoly.coeff[1] -= rs->dbl_d * (double)curr_y;
 
 		compute_line_size(rs->max_norm, &apoly,
 			rs->dbl_p, rs->dbl_d, direction,

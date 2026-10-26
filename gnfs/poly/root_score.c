@@ -9,7 +9,7 @@ useful. Again optionally, if you add to the functionality present here
 please consider making those additions public too, so that others may 
 benefit from your work.	
 
-$Id$
+$Id: root_score.c 838 2012-12-17 03:41:49Z jasonp_sf $
 --------------------------------------------------------------------*/
 
 #include "poly.h"

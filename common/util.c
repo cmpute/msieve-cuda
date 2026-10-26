@@ -12,6 +12,7 @@ benefit from your work.
 $Id$
 --------------------------------------------------------------------*/
 
+#include <sys/time.h>
 #include <util.h>
 
 /*---------------------------------------------------------------------*/
@@ -581,3 +582,46 @@ void * get_lib_symbol(libhandle_t h, const char *symbol_name)
 #endif
 	return s;
 }
+
+
+/*------------------------------------------------------------------*/
+/* ported from the trunk (used by the polyselect stats and engine) */
+
+double
+get_wall_time(void)
+{
+#if defined(WIN32) || defined(_WIN64)
+	LARGE_INTEGER freq, counter;
+	QueryPerformanceFrequency(&freq);
+	QueryPerformanceCounter(&counter);
+	return (double)counter.QuadPart / (double)freq.QuadPart;
+#else
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec + ts.tv_nsec / 1e9;
+#endif
+}
+
+#if defined(WIN32) || defined(_WIN64) || defined(_MSC_VER)
+int msieve_gettimeofday(struct timeval* tv, struct timezone* tz)
+{
+	/* Windows fallback; the POSIX branch below is what we build */
+	FILETIME ft;
+	unsigned __int64 tmpres = 0;
+	if (NULL != tv) {
+		GetSystemTimeAsFileTime(&ft);
+		tmpres |= ft.dwHighDateTime;
+		tmpres <<= 32;
+		tmpres |= ft.dwLowDateTime;
+		tmpres -= 116444736000000000ULL;
+		tv->tv_sec = (long)(tmpres / 10000000UL);
+		tv->tv_usec = (long)(tmpres % 10000000UL) / 10;
+	}
+	return 0;
+}
+#else
+int msieve_gettimeofday(struct timeval* tv, struct timezone* tz)
+{
+	return gettimeofday(tv, tz);
+}
+#endif

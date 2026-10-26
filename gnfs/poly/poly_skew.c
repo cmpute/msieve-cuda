@@ -9,18 +9,13 @@ useful. Again optionally, if you add to the functionality present here
 please consider making those additions public too, so that others may 
 benefit from your work.	
 
-$Id$
+$Id: poly_skew.c 1025 2018-08-19 02:20:28Z jasonp_sf $
 --------------------------------------------------------------------*/
 
 #include "poly_skew.h"
 
 /*------------------------------------------------------------------*/
 /* callback for root optimization */
-
-typedef struct {
-	FILE *all_poly_file;
-	poly_config_t *config;
-} rootopt_callback_data_t;
 
 static void
 rootopt_callback(void *extra, uint32 degree, 
@@ -55,21 +50,37 @@ rootopt_callback(void *extra, uint32 degree,
 	poly.combined_score = combined_score;
 	poly.skewness = skewness;
 
+#if 0
 	printf("save %le %.4lf %.2lf %le rroots %u\n", size_score,
 			root_score, skewness, combined_score,
 			num_real_roots);
+#endif
 
-	fprintf(data->all_poly_file, 
-		"# norm %le alpha %lf e %.3le rroots %u\nskew: %.2lf\n", 
-		size_score, root_score, combined_score, 
-		num_real_roots, skewness);
+	if (data->file_lock)
+		mutex_lock(data->file_lock);
+
+	fprintf(data->all_poly_file,
+		"# norm %le alpha %lf e %.3le rroots %u\nskew: %.2lf\n",
+		size_score, root_score, combined_score, num_real_roots, skewness);
 	for (i = 0; i <= degree; i++)
 		gmp_fprintf(data->all_poly_file, "c%u: %Zd\n", i, coeff1[i]);
 	for (i = 0; i <= 1; i++)
 		gmp_fprintf(data->all_poly_file, "Y%u: %Zd\n", i, coeff2[i]);
 	fflush(data->all_poly_file);
 
-	save_poly(config, &poly);
+	save_poly(config, &poly);            /* shared heap — inside the lock */
+
+	if (data->file_lock)
+		mutex_unlock(data->file_lock);
+
+	if (data->stats) {
+		char adbuf[64];
+		gmp_snprintf(adbuf, sizeof(adbuf), "%Zd",
+			coeff1[degree]);
+		poly_stats_add_rootopt(data->stats,
+			combined_score, adbuf);
+	}
+
 	mpz_poly_free(rpoly);
 	mpz_poly_free(apoly);
 }
@@ -77,16 +88,14 @@ rootopt_callback(void *extra, uint32 degree,
 /*------------------------------------------------------------------*/
 /* callbacks for size optimization */
 
-typedef struct {
-	poly_rootopt_t *rootopt;
-	rootopt_callback_data_t *rootopt_callback;
-} sizeopt_callback_data_t;
-
 static void sizeopt_callback(uint32 deg, mpz_t *alg_coeffs, mpz_t *rat_coeffs, 
 				double sizeopt_norm, double projective_alpha, 
 				void *extra)
 {
 	sizeopt_callback_data_t *callback = (sizeopt_callback_data_t *)extra;
+
+	if (callback->stats)
+		poly_stats_add_sizeopt(callback->stats);
 
 	poly_rootopt_run(callback->rootopt, alg_coeffs, 
 			rat_coeffs, sizeopt_norm, projective_alpha);
@@ -114,16 +123,74 @@ static void sizeopt_callback_log(uint32 deg, mpz_t *alg_coeffs, mpz_t *rat_coeff
 static void stage1_callback(mpz_t ad, mpz_t p, mpz_t m, void *extra) {
 	
 	poly_sizeopt_t *data = (poly_sizeopt_t *)extra;
-
+	
 	poly_sizeopt_run(data, ad, p, m);
 }
 
 static void stage1_callback_log(mpz_t ad, mpz_t p, mpz_t m, void *extra) {
 	
 	FILE *mfile = (FILE *)extra;
-	gmp_printf("%Zd %Zd %Zd\n", ad, p, m);
+	// gmp_printf("%Zd %Zd %Zd\n", ad, p, m);
 	gmp_fprintf(mfile, "%Zd %Zd %Zd\n", ad, p, m);
 	fflush(mfile);
+}
+
+static stage2_worker_t*
+build_stage2_workers(uint32 s, msieve_obj* obj, mpz_t n, uint32 degree,
+	poly_param_t* params, poly_config_t* config,
+	FILE* shared_poly_file, mutex_t* file_lock,
+	poly_stage_stats_t* stats)
+{
+	uint32 i;
+	stage2_worker_t* w = (stage2_worker_t*)xcalloc(s, sizeof(stage2_worker_t));
+
+	for (i = 0; i < s; i++) {
+		stage2_worker_t* k = w + i;
+
+		/* size opt — PRIVATE */
+		poly_sizeopt_init(&k->sizeopt_data, sizeopt_callback,
+			&k->sizeopt_callback_data);
+		mpz_set(k->sizeopt_data.gmp_N, n);
+		k->sizeopt_data.degree = degree;
+		k->sizeopt_data.max_stage1_norm = params->stage1_norm;
+		k->sizeopt_data.max_sizeopt_norm = params->stage2_norm;
+		k->sizeopt_data.best_saved_combined_e = 0.0;
+		k->sizeopt_data.num_rootopt = 0;
+		k->sizeopt_data.num_saved = 0;
+
+		/* root opt — PRIVATE */
+		poly_rootopt_init(&k->rootopt_data, obj, rootopt_callback,
+			&k->rootopt_callback_data);
+		mpz_set(k->rootopt_data.gmp_N, n);
+		k->rootopt_data.degree = degree;
+		k->rootopt_data.max_sizeopt_norm = params->stage2_norm;
+		k->rootopt_data.min_e = params->final_norm;
+		k->rootopt_data.min_e_bernstein = 0;
+
+		/* smaller problems (especially degree 5) run much faster
+		   when Bernstein's scoring function is used to weed out
+		   polynomials that probably cannot get their Murphy score
+		   optimized enough to exceed the E-value bound */
+
+		if (degree == 4) {
+			k->rootopt_data.min_e_bernstein = params->final_norm /
+				(30000 * pow(2.5, (params->digits - 90) / 5));
+		}
+		else if (degree == 5) {
+			k->rootopt_data.min_e_bernstein = params->final_norm /
+				(2.2 * pow(3.0, (params->digits - 100) / 10));
+		}
+
+		/* link + SHARED */
+		k->sizeopt_callback_data.rootopt = &k->rootopt_data;
+		k->sizeopt_callback_data.rootopt_callback = &k->rootopt_callback_data;
+		k->sizeopt_callback_data.stats = stats;
+		k->rootopt_callback_data.config = config;
+		k->rootopt_callback_data.all_poly_file = shared_poly_file; /* SHARED */
+		k->rootopt_callback_data.file_lock = file_lock;        /* SHARED */
+		k->rootopt_callback_data.stats = stats;
+	}
+	return w;
 }
 
 /*------------------------------------------------------------------*/
@@ -137,11 +204,16 @@ void find_poly_core(msieve_obj *obj, mpz_t n,
 	poly_rootopt_t rootopt_data;
 	sizeopt_callback_data_t sizeopt_callback_data;
 	rootopt_callback_data_t rootopt_callback_data;
+	poly_stage_stats_t poly_stats;
+	int poly_verbose = 0;
 	char buf[2048];
 	FILE *stage1_outfile = NULL;
 	FILE *sizeopt_outfile = NULL;
 	const char *lower_limit = NULL;
 	const char *upper_limit = NULL;
+
+	memset(&sizeopt_callback_data, 0, sizeof(sizeopt_callback_data));
+	memset(&rootopt_callback_data, 0, sizeof(rootopt_callback_data));
 
 	/* make sure the configured stages have the bounds that
 	   they need. We only have to check maximum bounds, since
@@ -178,6 +250,10 @@ void find_poly_core(msieve_obj *obj, mpz_t n,
 		if (tmp != NULL)
 			upper_limit = tmp + 10;
 
+		tmp = strstr(obj->nfs_args, "poly_verbose=");
+		if (tmp != NULL)
+			poly_verbose = atoi(tmp + 13);
+
 		/* old-style 'X,Y' format */
 		tmp = strchr(obj->nfs_args, ',');
 		if (tmp != NULL) {
@@ -203,10 +279,18 @@ void find_poly_core(msieve_obj *obj, mpz_t n,
 		   to file first */
 
 		if (obj->flags & MSIEVE_FLAG_NFS_POLYSIZE) {
+			sizeopt_data.best_saved_combined_e = 0.0;
+			sizeopt_data.num_rootopt = 0;
+			sizeopt_data.num_saved = 0;
+
 			poly_stage1_init(&stage1_data, 
 					stage1_callback, &sizeopt_data);
 		}
 		else {
+			sizeopt_data.best_saved_combined_e = 0.0;
+			sizeopt_data.num_rootopt = 0;
+			sizeopt_data.num_saved = 0;
+
 			sprintf(buf, "%s.m", obj->savefile.name);
 			stage1_outfile = fopen(buf, "a");
 			if (stage1_outfile == NULL) {
@@ -244,6 +328,7 @@ void find_poly_core(msieve_obj *obj, mpz_t n,
 			logprintf(obj, "time limit set to %.2f CPU-hours\n",
 				stage1_data.deadline / 3600.0);
 
+		
 		{ /* SB: tried L[1/3,c] fit; it is no better than this */
 			double e0 = 0.0625 * params->digits + 1.69;
 			if (degree > 4)
@@ -251,7 +336,7 @@ void find_poly_core(msieve_obj *obj, mpz_t n,
 					(0.0635 * params->digits + 1.608) :
 					(0.0526 * params->digits + 3.23);
 			e0 = exp(-log(10) * e0); 
-#ifdef HAVE_CUDA
+#ifdef HAVE_CUDA_POLY
 			e0 *= 1.15;
 #endif
 			logprintf(obj, "expecting poly E from %.2le to > %.2le\n",
@@ -276,17 +361,27 @@ void find_poly_core(msieve_obj *obj, mpz_t n,
 		   to file first */
 
 		if (obj->flags & MSIEVE_FLAG_NFS_POLYROOT) {
+			rootopt_data.best_saved_combined_e = 0.0;
+			rootopt_data.num_saved = 0;
+
 			sizeopt_callback_data.rootopt = &rootopt_data;
 			sizeopt_callback_data.rootopt_callback = &rootopt_callback_data;
 
 			poly_sizeopt_init(&sizeopt_data, 
 					sizeopt_callback, &sizeopt_callback_data);
+
+			// in order to save in-progress rootopt results we
+			// need to forward the flags to the sizeopt handler.
+			sizeopt_data.flags = obj->flags;
 		}
 		else {
+			rootopt_data.best_saved_combined_e = 0.0;
+			rootopt_data.num_saved = 0;
+
 			sprintf(buf, "%s.ms", obj->savefile.name);
 			sizeopt_outfile = fopen(buf, "a");
 			if (sizeopt_outfile == NULL) {
-				printf("error: cannot open sizeopt file\n");
+				printf("error: cannot open sizeopt file %s\n", buf);
 				exit(-1);
 			}
 			poly_sizeopt_init(&sizeopt_data, sizeopt_callback_log, 
@@ -337,12 +432,81 @@ void find_poly_core(msieve_obj *obj, mpz_t n,
 			printf("error: cannot open root opt file\n");
 			exit(-1);
 		}
+		else
+		{
+			printf("rootopt file %s opened for appending\n", buf);
+		}
 	}
 
 
 	if (obj->flags & MSIEVE_FLAG_NFS_POLY1) {
 
+		poly_stats_init(&poly_stats, poly_verbose, 0);
+
+		{
+			double e_thr = 0.0;
+			uint64 max_p = 0;
+			const char* tmp;
+			if (obj->nfs_args) {
+				tmp = strstr(obj->nfs_args, "murphy_e_threshold=");
+				if (tmp) e_thr = atof(tmp + 19);
+				tmp = strstr(obj->nfs_args, "num_polys=");
+				if (tmp) max_p = strtoull(tmp + 10, NULL, 10);
+			}
+			poly_stats_set_abort(&poly_stats, obj, e_thr, max_p);
+		}
+
+		stage1_data.stats = &poly_stats;
+		if (obj->flags & MSIEVE_FLAG_NFS_POLYSIZE)
+			sizeopt_callback_data.stats = &poly_stats;
+		if (obj->flags & MSIEVE_FLAG_NFS_POLYROOT)
+			rootopt_callback_data.stats = &poly_stats;
+
+
+		stage2_worker_t* workers = NULL;
+		uint32 num_s2 = 1, wi;
+		mutex_t s2_file_lock;
+
+		if (obj->flags & MSIEVE_FLAG_NFS_POLYSIZE) {
+			const char* sa = obj->nfs_args ?
+				strstr(obj->nfs_args, "stage2_threads=") : NULL;
+			if (sa) num_s2 = MAX(1, atoi(sa + 15));
+			num_s2 = MAX(num_s2, obj->num_threads);   /* NEW: guarantee one bundle
+												  per producer thread for
+												  the CPU inline path */
+			if (num_s2 > 1) {
+				mutex_init(&s2_file_lock);
+				workers = build_stage2_workers(num_s2, obj, n, degree,
+					params, config,
+					rootopt_callback_data.all_poly_file,  /* the .p, opened at ~428 */
+					&s2_file_lock, &poly_stats);
+				stage1_data.stage2_workers = workers;
+				stage1_data.num_stage2_workers = num_s2;
+			}
+		}
+
 		poly_stage1_run(obj, &stage1_data);
+
+		poly_stats_report(&poly_stats, 1);
+		poly_stats_free(&poly_stats);
+
+		if (workers) {
+			for (wi = 0; wi < num_s2; wi++) {
+				poly_sizeopt_free(&workers[wi].sizeopt_data);
+				poly_rootopt_free(&workers[wi].rootopt_data);
+			}
+			free(workers);
+			mutex_free(&s2_file_lock);
+		}
+
+		if (!(obj->flags & MSIEVE_FLAG_NFS_POLYSIZE))
+		{
+			// just doing -np1?  need to close the 
+			// logfile for stage1 hits.
+			if (stage1_outfile != NULL) {
+				fclose(stage1_outfile);
+			}
+		}
 
 		poly_stage1_free(&stage1_data);
 		if (obj->flags & MSIEVE_FLAG_NFS_POLYROOT) {
@@ -365,7 +529,7 @@ void find_poly_core(msieve_obj *obj, mpz_t n,
 		sprintf(buf, "%s.m", obj->savefile.name);
 		stage1_outfile = fopen(buf, "r");
 		if (stage1_outfile == NULL) {
-			printf("error: cannot open sizeopt input file\n");
+			printf("error: cannot open sizeopt input file %s\n", buf);
 			exit(-1);
 		}
 

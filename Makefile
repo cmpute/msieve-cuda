@@ -96,6 +96,9 @@ else
 	CUDA_SINGLE_BINARY ?= 1
 endif
 	CFLAGS += -I"$(CUDA_ROOT)/include" -Icub -DHAVE_CUDA
+	# feature macros the ported trunk polyselect code keys on (GPU poly
+	# stage 1 and GPU Lanczos are always built here)
+	CFLAGS += -DHAVE_CUDA_POLY -DHAVE_CUDA_LA -DHAVE_LA_CUDA
 ifeq ($(CUDA_SINGLE_BINARY),1)
 	CFLAGS += -DMSIEVE_CUDA_SINGLE_BINARY
 	LIBS += $(CUDA_RUNTIME_LIBS) $(CUDA_DRIVER_LIBS)
@@ -191,6 +194,7 @@ COMMON_SRCS = \
 	common/smallfact/tinyqs.c \
 	common/batch_factor.c \
 	common/cuda_xface.c \
+	common/cuda_xface_la.c \
 	common/dickman.c \
 	common/driver.c \
 	common/expr_eval.c \
@@ -302,7 +306,8 @@ NFS_HDR = \
 NFS_GPU_HDR = \
 	gnfs/poly/stage1/stage1_core_gpu/stage1_core.cu \
 	gnfs/poly/stage1/stage1_core_gpu/cuda_intrinsics.h \
-	gnfs/poly/stage1/stage1_core_gpu/stage1_core.h
+	gnfs/poly/stage1/stage1_core_gpu/stage1_core.h \
+	gnfs/poly/stage1/ht_intrinsics.h
 
 NFS_NOGPU_HDR = \
 	gnfs/poly/stage1/cpu_intrinsics.h
@@ -311,11 +316,15 @@ NFS_SRCS = \
 	gnfs/poly/poly.c \
 	gnfs/poly/poly_param.c \
 	gnfs/poly/poly_skew.c \
+	gnfs/poly/poly_stats.c \
 	gnfs/poly/polyutil.c \
 	gnfs/poly/root_score.c \
 	gnfs/poly/size_score.c \
 	gnfs/poly/stage1/stage1.c \
+	gnfs/poly/stage1/stage1_engine.c \
 	gnfs/poly/stage1/stage1_roots.c \
+	gnfs/poly/stage1/stage1_sieve_cpu.c \
+	gnfs/poly/stage1/stage1_sieve_cpu_hashtable.c \
 	gnfs/poly/stage2/optimize.c \
 	gnfs/poly/stage2/optimize_deg6.c \
 	gnfs/poly/stage2/root_sieve.c \
@@ -347,8 +356,7 @@ NFS_GPU_SRCS = \
 
 NFS_GPU_OBJS = $(NFS_GPU_SRCS:.c=.no)
 
-NFS_NOGPU_SRCS = \
-	gnfs/poly/stage1/stage1_sieve_cpu.c
+NFS_NOGPU_SRCS =
 
 NFS_NOGPU_OBJS = $(NFS_NOGPU_SRCS:.c=.no)
 
@@ -402,6 +410,15 @@ clean:
 %.o: %.c $(COMMON_HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+# the GPU xface and the GPU Lanczos share the trunk header layer with
+# the ported polyselect (gpu_launch_t et al. changed shape upstream;
+# every GPU translation unit must agree on the layout)
+common/cuda_xface.o common/cuda_xface_la.o: common/cuda_xface%.o: common/cuda_xface%.c $(COMMON_HDR)
+	$(CC) -Ims_include $(CFLAGS) -c -o $@ $<
+
+common/lanczos/%.o: common/lanczos/%.c $(COMMON_HDR)
+	$(CC) -Ims_include $(CFLAGS) -c -o $@ $<
+
 # QS build rules
 
 mpqs/sieve_core_generic_32k.qo: mpqs/sieve_core.c $(COMMON_HDR) $(QS_HDR)
@@ -421,6 +438,14 @@ mpqs/sieve_core_generic_64k.qo: mpqs/sieve_core.c $(COMMON_HDR) $(QS_HDR)
 
 %.no: %.c $(COMMON_HDR) $(NFS_HDR)
 	$(CC) $(CFLAGS) -Ignfs -c -o $@ $<
+
+# the polyselect subsystem is ported from the jasonp trunk (via
+# bbuhrow/yafu), which reorganized the headers into ms_include/; those
+# translation units compile against the trunk layer exclusively, the
+# rest of the tree keeps the historical include/ layout (the two are
+# prefix-compatible where it matters, e.g. msieve_obj)
+gnfs/poly/%.no: gnfs/poly/%.c $(COMMON_HDR) $(NFS_HDR)
+	$(CC) -Ims_include $(CFLAGS) -Ignfs -Ignfs/poly -Ignfs/poly/stage1 -c -o $@ $<
 
 # GPU build rules
 
