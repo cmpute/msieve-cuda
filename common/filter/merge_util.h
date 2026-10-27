@@ -170,6 +170,34 @@ void load_next_relset_group_detach(merge_aux_t *aux,
 			relation_set_t *relset_array,
 			uint32 min_ideal_weight);
 
+/* Deferred-heap variants for batched rounds.  The detach and store
+   twins maintain adjacency lists and min_relset_size but never touch
+   the heaps; every ideal whose heap position may no longer match its
+   key is recorded, and merge_defer_settle() reconciles the heaps
+   serially at the end of the round, rescanning each such ideal's
+   minimum once no matter how often the round touched it.  No two
+   relation sets may be in flight in two threads at once, and no heap
+   operation may run between the deferred calls and their settle */
+
+void load_next_relset_group_detach_deferred(merge_aux_t *aux,
+			heap_t *active_heap, heap_t *inactive_heap,
+			ideal_list_t *ideal_list,
+			relation_set_t *relset_array,
+			uint32 min_ideal_weight);
+
+uint32 heap_add_relset_deferred(heap_t *active_heap,
+			heap_t *inactive_heap,
+			ideal_list_t *list,
+			relation_set_t *r,
+			uint32 relset_num,
+			uint32 min_ideal_weight);
+
+void merge_defer_init(uint32 num_ideals);
+void merge_defer_free(void);
+void merge_defer_settle(heap_t *active_heap, heap_t *inactive_heap,
+			ideal_list_t *ideal_list,
+			relation_set_t *relset_array);
+
 /* find all the relation sets that contain a given ideal,
    and remove the ideal from those relation sets. Each
    relation set has its count of small ideals incremented;

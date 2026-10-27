@@ -213,6 +213,9 @@ typedef struct ideal_set_t {
 				   ideal (no ordering assumed) */
 	uint32 next;            /* compact heap-list node reference */
 	uint32 prev;            /* compact heap-list node reference */
+	uint32 lock;            /* spinlock guarding this entry while a
+				   batched merge's detach and store run;
+				   always 0 outside one */
 } ideal_set_t;
 
 /* relation sets with more than this many relations are deleted */

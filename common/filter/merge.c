@@ -29,6 +29,7 @@ typedef struct {
 	double pop;        /* batched: pops, independence scan, snapshots */
 	double merge;      /* the merges (parallel only in batched mode) */
 	double store;      /* serial: writeback + re-heapify */
+	double detach;     /* batched: heap+adjacency detach of all groups */
 	double deferred;   /* batched: ideals the independence scan skipped */
 	double rebalance;  /* active<->inactive swaps and target updates */
 	double bury;       /* burying heavy ideals + activating new ones */
@@ -41,10 +42,10 @@ static void merge_profile_print(msieve_obj *obj, merge_profile_t *p,
 				uint32 batched) {
 
 	if (batched) {
-		logprintf(obj, "merge profile: pop+select %.1f s, merges "
-				"%.1f s, apply %.1f s, deferred %.1f s, "
+		logprintf(obj, "merge profile: pop+select %.1f s, "
+				"slots+settle %.1f s, deferred %.1f s, "
 				"rebalance %.1f s, bury %.1f s\n",
-				p->pop, p->merge, p->store, p->deferred,
+				p->pop, p->store, p->deferred,
 				p->rebalance, p->bury);
 		logprintf(obj, "merge rounds %" PRIu64 ": %" PRIu64
 				" ideals merged in parallel, %" PRIu64
@@ -93,6 +94,9 @@ static void matrix_weight_add(matrix_weight_t *m, relation_set_t *r) {
 			m->weights[i] = 0;
 		m->num_weights_alloc = w + 100;
 	}
+#if defined(HAVE_OMP)
+#pragma omp atomic
+#endif
 	m->weights[w]++;
 }
 
@@ -100,6 +104,9 @@ static void matrix_weight_sub(matrix_weight_t *m, relation_set_t *r) {
 
 	uint32 w = r->num_small_ideals +
 		   r->num_large_ideals;
+#if defined(HAVE_OMP)
+#pragma omp atomic
+#endif
 	m->weights[w]--;
 }
 
@@ -382,6 +389,52 @@ static uint32 store_next_relset_group(merge_aux_t *aux,
 }
 
 /*--------------------------------------------------------------------*/
+/* one batched slot, run entirely on one thread: detach the group from
+   the adjacency structure (heaps deferred), merge it, write the merged
+   relation sets back (heaps deferred).  Returns the cycles gained */
+
+static uint32 merge_slot_step(merge_aux_t *aux,
+			heap_t *active_heap, heap_t *inactive_heap,
+			ideal_list_t *ideal_list,
+			relation_set_t *relset_array,
+			matrix_weight_t *mat_weight) {
+
+	uint32 num_cycles = 0;
+	uint32 i;
+
+	load_next_relset_group_detach_deferred(aux,
+			active_heap, inactive_heap,
+			ideal_list, relset_array, 0);
+
+	do_merges_core(aux);
+
+	for (i = 0; i < aux->num_relsets - 1; i++) {
+		uint32 relset_num = aux->tmp_relset_idx[i];
+		relation_set_t *r = relset_array + relset_num;
+
+		*r = aux->tmp_relsets[i];
+
+		if (r->num_relations == 0) {
+			continue;
+		}
+		else if (r->num_relations > MAX_RELSET_SIZE) {
+			merge_relset_free(aux->data_pool, r);
+			memset(r, 0, sizeof(relation_set_t));
+			continue;
+		}
+
+		if (heap_add_relset_deferred(active_heap, inactive_heap,
+					ideal_list, r, relset_num,
+					0) == 0) {
+			num_cycles++;
+			matrix_weight_add(mat_weight, r);
+		}
+	}
+
+	return num_cycles;
+}
+
+/*--------------------------------------------------------------------*/
 #define NUM_CYCLE_BINS 9
 
 static int set_merge_cycle_targets(msieve_obj *obj, uint32 min_cycles,
@@ -516,6 +569,7 @@ int32 filter_merge_full(msieve_obj *obj, merge_t *merge, uint32 min_cycles) {
 	/* declared in ms_include/util.h, which the polyselect
 	   subsystem owns; the filter does not include it */
 	extern double get_wall_time(void);
+	extern uint64 merge_stat_recompute;
 
 	if (obj->nfs_args != NULL) {
 		const char *batch_arg = strstr(obj->nfs_args, "merge_batch=");
@@ -549,9 +603,21 @@ int32 filter_merge_full(msieve_obj *obj, merge_t *merge, uint32 min_cycles) {
 	heap_init(&inactive_heap);
 	ideal_list_init(&ideal_list, num_ideals, 0, merge->data_pool);
 	matrix_weight_init(&mat_weight);
+	if (merge_batch > 0) {
+		/* a cycle's weight is bounded by its small-ideal count
+		   (16 bits) plus its large-ideal count (<= 500); size the
+		   table up front so the parallel slots never realloc it */
+		mat_weight.weights = (uint32 *)xrealloc(mat_weight.weights,
+				66100 * sizeof(uint32));
+		memset(mat_weight.weights + mat_weight.num_weights_alloc, 0,
+				(66100 - mat_weight.num_weights_alloc) *
+				sizeof(uint32));
+		mat_weight.num_weights_alloc = 66100;
+	}
 
 	if (merge_batch > 0) {
 		uint32 k;
+		merge_defer_init(num_ideals);
 		batch_aux = (merge_aux_t *)xmalloc(merge_batch *
 						sizeof(merge_aux_t));
 		batch_ideals = (uint32 *)xmalloc(merge_batch *
@@ -713,18 +779,22 @@ int32 filter_merge_full(msieve_obj *obj, merge_t *merge, uint32 min_cycles) {
 
 			/* Batched: pop a batch of ideals, find the subset
 			   whose relation-set groups are pairwise disjoint,
-			   merge that subset in parallel on private auxes,
-			   then apply the results serially in pop order.
-			   The bookkeeping each application performs is what
-			   the serial loop would have performed running
-			   these merges one at a time in pop order with
-			   these outputs; groups are snapshotted while the
-			   graph is untouched, and disjointness guarantees
-			   one group's merge cannot change another's input.
-			   Two heuristics differ from the serial loop by
-			   design: keys are not refreshed within a round,
-			   and active<->inactive rebalancing runs once per
-			   round rather than once per merge */
+			   snapshot and detach those groups, merge them in
+			   parallel on private auxes, then write the merged
+			   relation sets back serially in pop order.  The
+			   bookkeeping is what the serial loop would have
+			   performed running these merges one at a time in
+			   pop order with these outputs, minus that a group
+			   detach can no longer see another group's merges
+			   in its min-size estimates - a heuristic input,
+			   not a consistency requirement.  Groups are
+			   snapshotted while the graph is untouched, and
+			   disjointness guarantees one group's merge cannot
+			   change another's input.  Two heuristics differ
+			   from the serial loop by design: keys are not
+			   refreshed within a round, and active<->inactive
+			   rebalancing runs once per round rather than once
+			   per merge */
 
 			uint32 nbatch = 0, nselected = 0, ndef = 0;
 			uint32 j;
@@ -788,37 +858,61 @@ int32 filter_merge_full(msieve_obj *obj, merge_t *merge, uint32 min_cycles) {
 
 			prof.pop += get_wall_time() - tick_start;
 
-			/* merge each selected group on its private aux;
-			   only the shared pool needs mutual exclusion */
+			/* every selected group runs detach, merge and
+			   store on one thread; the groups are pairwise
+			   disjoint, so the only shared state is the
+			   ideals at the groups' fringe (each under its
+			   own spinlock), the allocation pool (one
+			   critical section) and the cycle weight table
+			   (atomic increments).  The heaps are not
+			   touched at all: changed keys are recorded and
+			   merge_defer_settle() reconciles them below.
+			   Detaching before the merge is what hands each
+			   group's payloads to it; the merges may then
+			   free and reuse those payloads freely */
 
 			tick_start = get_wall_time();
-#if defined(HAVE_OMP)
-#pragma omp parallel for num_threads(nthreads) schedule(dynamic,1)
-#endif
-			for (j = 0; j < (int32)nselected; j++)
-				do_merges_core(&batch_aux[selected_slots[j]]);
-			prof.merge += get_wall_time() - tick_start;
-
-			/* apply the merges serially, in pop order:
-			   detach each group from the heaps and the
-			   adjacency lists, then write the merged
-			   relation sets back */
-
-			tick_start = get_wall_time();
-			for (j = 0; j < nselected; j++) {
-				merge_aux_t *slot_aux = &batch_aux[
-							selected_slots[j]];
-				load_next_relset_group_detach(slot_aux,
-						&active_heap, &inactive_heap,
-						&ideal_list, relset_array, 0);
-				num_cycles += store_next_relset_group(slot_aux,
-						&active_heap, &inactive_heap,
-						&ideal_list, relset_array,
-						&mat_weight);
-			}
 			for (j = 0; j < (int32)nclaimed; j++)
 				claimed[claimed_list[j]] = 0;
 			nclaimed = 0;
+
+			if (nselected >= 32) {
+				uint32 *slot_cycles = (uint32 *)xcalloc(
+						(size_t)nselected,
+						sizeof(uint32));
+#if defined(HAVE_OMP)
+#pragma omp parallel for num_threads(nthreads) schedule(dynamic,1)
+#endif
+				for (j = 0; j < (int32)nselected; j++) {
+					slot_cycles[j] = merge_slot_step(
+						&batch_aux[selected_slots[j]],
+						&active_heap, &inactive_heap,
+						&ideal_list, relset_array,
+						&mat_weight);
+				}
+				for (j = 0; j < nselected; j++)
+					num_cycles += slot_cycles[j];
+				free(slot_cycles);
+			}
+			else {
+				/* a small round: thread startup and the
+				   settle pass cost more than they save */
+				for (j = 0; j < nselected; j++) {
+					num_cycles += merge_slot_step(
+						&batch_aux[selected_slots[j]],
+						&active_heap, &inactive_heap,
+						&ideal_list, relset_array,
+						&mat_weight);
+				}
+			}
+
+			/* reconcile the heaps: one relink or one rescan
+			   per ideal the round changed, instead of the
+			   per-relation-set unlink/relink/rescan the
+			   serial loop performs */
+
+			merge_defer_settle(&active_heap, &inactive_heap,
+					&ideal_list, relset_array);
 			prof.store += get_wall_time() - tick_start;
 
 			/* the ideals the independence scan skipped: their
@@ -845,6 +939,17 @@ int32 filter_merge_full(msieve_obj *obj, merge_t *merge, uint32 min_cycles) {
 			prof.selected += nselected;
 			prof.deferred_n += ndef;
 			prof.steps++;
+			if (prof.steps % 1000 == 0)
+				logprintf(obj, "round %" PRIu64 ": popped %u, "
+						"parallel %u, deferred %u, "
+						"cycles %u, pop %.1f s, "
+						"slots %.1f s, def %.1f s, "
+						"recomp %" PRIu64 "\n",
+						prof.steps, nbatch,
+						nselected, ndef, num_cycles,
+						prof.pop, prof.store,
+						prof.deferred,
+						merge_stat_recompute);
 		}
 
 		/* swap ideals between the active and inactive
@@ -983,6 +1088,7 @@ int32 filter_merge_full(msieve_obj *obj, merge_t *merge, uint32 min_cycles) {
 clean_up:
 	if (batch_aux != NULL) {
 		uint32 k;
+		merge_defer_free();
 		for (k = 0; k < merge_batch; k++)
 			merge_aux_free(&batch_aux[k]);
 		free(batch_aux);

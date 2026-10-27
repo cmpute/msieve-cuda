@@ -240,6 +240,9 @@ uint32 *merge_relset_realloc(merge_mem_pool_t *pool, relation_set_t *r,
 		out = merge_mem_alloc(pool, new_words);
 		memcpy(out, r->data,
 			(size_t)MIN(old_words, new_words) * sizeof(uint32));
+#if defined(HAVE_OMP)
+#pragma omp critical(mergepool)
+#endif
 		merge_mem_free_class(pool, r->data, old_idx);
 		relation_set_set_alloc_class(r, new_idx);
 		return out;
@@ -248,6 +251,9 @@ uint32 *merge_relset_realloc(merge_mem_pool_t *pool, relation_set_t *r,
 	out = (uint32 *)xmalloc((size_t)new_words * sizeof(uint32));
 	memcpy(out, r->data,
 		(size_t)MIN(old_words, new_words) * sizeof(uint32));
+#if defined(HAVE_OMP)
+#pragma omp critical(mergepool)
+#endif
 	merge_mem_free_class(pool, r->data, old_idx);
 	relation_set_set_alloc_class(r, RELSET_ALLOC_EXTERNAL);
 	return out;
@@ -265,8 +271,12 @@ void merge_relset_free(merge_mem_pool_t *pool, relation_set_t *r) {
 	idx = relation_set_alloc_class(r);
 	if (idx == RELSET_ALLOC_EXTERNAL)
 		free(r->data);
-	else if (idx < MERGE_POOL_NUM_CLASSES)
+	else if (idx < MERGE_POOL_NUM_CLASSES) {
+#if defined(HAVE_OMP)
+#pragma omp critical(mergepool)
+#endif
 		merge_mem_free_class(pool, r->data, idx);
+	}
 	else {
 		printf("error: invalid pooled relation-set allocation class\n");
 		exit(-1);
@@ -610,6 +620,301 @@ uint32 heap_add_relset(heap_t *active_heap,
 }
 
 /*--------------------------------------------------------------------*/
+uint64 merge_stat_recompute = 0;
+uint64 merge_stat_ideal_ops = 0;
+
+/*--------------------------------------------------------------------*/
+/* Deferred heap maintenance for batched merges.
+   The parallel half of a merge round does not touch the heaps at all:
+   heap_remove_relset_deferred() and heap_add_relset_deferred() edit
+   adjacency lists and min_relset_size, and record each ideal whose
+   heap position may no longer match its key.  merge_defer_settle()
+   runs serially at the end of the round and reconciles the heaps:
+   relink-list ideals get their (already exact) key rehinted, rescan-list
+   ideals get their min recomputed once no matter how many of their
+   relation sets the round touched.  A dead ideal (adjacency emptied)
+   is unlinked and left out of the heap; it can never come back, since
+   a new relation set containing it would need a parent containing it. */
+
+typedef struct {
+	uint8 *relink_map;     /* per-ideal: key changed, value exact */
+	uint32 *relink_list;
+	uint32 num_relink;
+	uint32 relink_alloc;
+	uint8 *rescan_map;     /* per-ideal: key unknown, needs a rescan */
+	uint32 *rescan_list;
+	uint32 num_rescan;
+	uint32 rescan_alloc;
+} merge_defer_t;
+
+static merge_defer_t merge_defer;
+
+void merge_defer_init(uint32 num_ideals) {
+	memset(&merge_defer, 0, sizeof(merge_defer));
+	merge_defer.relink_map = (uint8 *)xcalloc((size_t)num_ideals,
+						sizeof(uint8));
+	merge_defer.rescan_map = (uint8 *)xcalloc((size_t)num_ideals,
+						sizeof(uint8));
+}
+
+void merge_defer_free(void) {
+	free(merge_defer.relink_map);
+	free(merge_defer.relink_list);
+	free(merge_defer.rescan_map);
+	free(merge_defer.rescan_list);
+	memset(&merge_defer, 0, sizeof(merge_defer));
+}
+
+static void merge_defer_clear(void) {
+	uint32 i;
+	for (i = 0; i < merge_defer.num_relink; i++)
+		merge_defer.relink_map[merge_defer.relink_list[i]] = 0;
+	for (i = 0; i < merge_defer.num_rescan; i++)
+		merge_defer.rescan_map[merge_defer.rescan_list[i]] = 0;
+	merge_defer.num_relink = 0;
+	merge_defer.num_rescan = 0;
+}
+
+/* record that ideal's heap position is stale; exact_key says the new
+   min_relset_size is already final (a store lowered it) or not (a
+   detach removed the recorded minimum).  Called with the ideal's own
+   lock held, but the mark lists are shared across all threads, so
+   they carry their own lock; the nesting order ideal -> defer lists
+   is the only one that exists */
+
+static uint32 merge_defer_lock = 0;
+
+static void merge_defer_mark(ideal_list_t *ideal_list, uint32 ideal,
+				int exact_key) {
+	merge_defer_t *d = &merge_defer;
+	uint8 *map = exact_key ? d->relink_map : d->rescan_map;
+
+	if (map[ideal])
+		return;
+
+#if defined(__x86_64__) || defined(__i386__)
+	while (__sync_lock_test_and_set(&merge_defer_lock, 1)) {
+		while (merge_defer_lock)
+			__builtin_ia32_pause();
+	}
+#else
+	while (__sync_lock_test_and_set(&merge_defer_lock, 1)) {
+		while (merge_defer_lock);
+	}
+#endif
+	map[ideal] = 1;
+	{
+		uint32 *list = exact_key ? d->relink_list : d->rescan_list;
+		uint32 num = exact_key ? d->num_relink : d->num_rescan;
+		uint32 *alloc = exact_key ? &d->relink_alloc :
+						&d->rescan_alloc;
+
+		if (num == *alloc) {
+			uint32 new_alloc = *alloc ? *alloc * 2 : 65536;
+			list = (uint32 *)xrealloc(list,
+					(size_t)new_alloc * sizeof(uint32));
+			*alloc = new_alloc;
+			if (exact_key)
+				d->relink_list = list;
+			else
+				d->rescan_list = list;
+		}
+		list[num++] = ideal;
+		if (exact_key)
+			d->num_relink = num;
+		else
+			d->num_rescan = num;
+	}
+	__sync_lock_release(&merge_defer_lock);
+}
+
+void merge_defer_settle(heap_t *active_heap, heap_t *inactive_heap,
+			ideal_list_t *ideal_list,
+			relation_set_t *relset_array) {
+
+	uint32 i;
+	merge_defer_t *d = &merge_defer;
+
+	for (i = 0; i < d->num_relink; i++) {
+		uint32 ideal = d->relink_list[i];
+		ideal_set_t *ideal_set = ideal_list->list + ideal;
+		heap_t *heap = ideal_set->active ? active_heap :
+							inactive_heap;
+		heap_remove_ideal(heap, ideal_list, ideal);
+		if (ideal_set->num_relsets > 0)
+			heap_add_ideal(heap, ideal_list, ideal);
+	}
+
+	for (i = 0; i < d->num_rescan; i++) {
+		uint32 ideal = d->rescan_list[i];
+		ideal_set_t *ideal_set = ideal_list->list + ideal;
+		heap_t *heap = ideal_set->active ? active_heap :
+							inactive_heap;
+		heap_remove_ideal(heap, ideal_list, ideal);
+		if (ideal_set->num_relsets > 0) {
+			uint32 j;
+			uint32 curr_weight = UINT32_MAX;
+			for (j = 0; j < ideal_set->num_relsets; j++) {
+				relation_set_t *r2 = relset_array +
+						ideal_set->relsets[j];
+				curr_weight = MIN(curr_weight,
+						r2->num_small_ideals +
+						r2->num_large_ideals);
+			}
+			ideal_set->min_relset_size = curr_weight;
+			heap_add_ideal(heap, ideal_list, ideal);
+		}
+	}
+
+	merge_defer_clear();
+}
+
+/*--------------------------------------------------------------------*/
+static void merge_ideal_lock(ideal_set_t *ideal_set) {
+#if defined(__x86_64__) || defined(__i386__)
+	while (__sync_lock_test_and_set(&ideal_set->lock, 1)) {
+		while (ideal_set->lock)
+			__builtin_ia32_pause();
+	}
+#else
+	while (__sync_lock_test_and_set(&ideal_set->lock, 1)) {
+		while (ideal_set->lock);
+	}
+#endif
+}
+
+static void merge_ideal_unlock(ideal_set_t *ideal_set) {
+	__sync_lock_release(&ideal_set->lock);
+}
+
+/* batched twin of heap_remove_relset: adjacency list maintained, heap
+   untouched, changed keys deferred to merge_defer_settle(). Called with
+   many groups in flight, so every ideal_set access is under its lock */
+
+void heap_remove_relset_deferred(heap_t *active_heap,
+				heap_t *inactive_heap,
+				ideal_list_t *ideal_list,
+				relation_set_t *r,
+				relation_set_t *relset_array,
+				uint32 min_ideal_weight) {
+
+	uint32 i, j;
+	uint32 weight = r->num_small_ideals + r->num_large_ideals;
+	uint32 relset_num = r - relset_array;
+
+	(void)active_heap;
+	(void)inactive_heap;
+	(void)min_ideal_weight;
+
+	for (i = 0; i < r->num_large_ideals; i++) {
+		uint32 ideal = r->data[r->num_relations + i];
+		ideal_set_t *ideal_set = ideal_list->list + ideal;
+		uint32 prev_weight;
+
+		merge_ideal_lock(ideal_set);
+
+		prev_weight = ideal_set->min_relset_size;
+
+		/* remove the relation set from the list of
+		   relation sets containing ideal i */
+
+		for (j = 0; j < ideal_set->num_relsets; j++) {
+			if (ideal_set->relsets[j] == relset_num)
+				break;
+		}
+		if (j == ideal_set->num_relsets) {
+			printf("error: relation set missing from ideal "
+					"adjacency list\n");
+			exit(-1);
+		}
+		ideal_set->relsets[j] = ideal_set->relsets[
+					--ideal_set->num_relsets];
+
+		if (ideal_set->num_relsets == 0) {
+
+			/* no more relations with this ideal */
+
+			ideal_set->min_relset_size = UINT32_MAX;
+			merge_mem_free(ideal_list->data_pool,
+					ideal_set->relsets,
+					ideal_set->num_relsets_alloc);
+			ideal_set->num_relsets_alloc = 0;
+			ideal_set->relsets = NULL;
+			merge_defer_mark(ideal_list, ideal, 0);
+		}
+		else if (weight == prev_weight) {
+
+			/* r was the recorded lightest relation set; the
+			   true minimum is unknown until a rescan */
+
+			merge_defer_mark(ideal_list, ideal, 0);
+		}
+
+		merge_ideal_unlock(ideal_set);
+	}
+}
+
+/* batched twin of heap_add_relset */
+
+uint32 heap_add_relset_deferred(heap_t *active_heap,
+				heap_t *inactive_heap,
+				ideal_list_t *ideal_list,
+				relation_set_t *r,
+				uint32 relset_num,
+				uint32 min_ideal_weight) {
+
+	uint32 i;
+	uint32 weight = r->num_small_ideals + r->num_large_ideals;
+
+	(void)active_heap;
+	(void)inactive_heap;
+	(void)min_ideal_weight;
+
+	relation_set_set_num_active(r, 0);
+
+	for (i = 0; i < r->num_large_ideals; i++) {
+		uint32 ideal = r->data[r->num_relations + i];
+		ideal_set_t *ideal_set = ideal_list->list + ideal;
+		uint32 prev_weight;
+
+		merge_ideal_lock(ideal_set);
+
+		prev_weight = ideal_set->min_relset_size;
+
+		if (ideal_set->num_relsets == ideal_set->num_relsets_alloc) {
+			uint32 old_alloc = ideal_set->num_relsets_alloc;
+			uint64 grown = old_alloc ? (uint64)old_alloc + MAX((uint64)3,
+					(uint64)old_alloc / 2) : 4;
+			if (grown > UINT32_MAX) {
+				printf("error: ideal adjacency exceeds 32-bit capacity\n");
+				exit(-1);
+			}
+			ideal_set->num_relsets_alloc = (uint32)grown;
+			ideal_set->relsets = merge_mem_realloc(ideal_list->data_pool,
+						ideal_set->relsets, old_alloc,
+						ideal_set->num_relsets_alloc);
+		}
+
+		ideal_set->relsets[ideal_set->num_relsets++] = relset_num;
+		ideal_set->min_relset_size = MIN(prev_weight, weight);
+
+		if (weight < prev_weight)
+			merge_defer_mark(ideal_list, ideal, 1);
+
+		merge_ideal_unlock(ideal_set);
+
+		if (ideal_set->active)
+			relation_set_set_num_active(r,
+					relation_set_num_active(r) + 1);
+	}
+
+	/* return the number of ideals that still
+	   need merging before r can become a cycle */
+
+	return relation_set_num_active(r);
+}
+
+
 void heap_remove_relset(heap_t *active_heap,
 			heap_t *inactive_heap,
 			ideal_list_t *ideal_list,
@@ -677,6 +982,7 @@ void heap_remove_relset(heap_t *active_heap,
 
 			if (weight == prev_weight) {
 				uint32 curr_weight = UINT32_MAX;
+				merge_stat_recompute++;
 				for (j = 0; j < ideal_set->num_relsets; j++) {
 					relation_set_t *r2 = relset_array +
 							ideal_set->relsets[j];
@@ -782,6 +1088,24 @@ void load_next_relset_group_detach(merge_aux_t *aux,
 		uint32 relset_num = aux->tmp_relset_idx[i];
 		relation_set_t *r = relset_array + relset_num;
 		heap_remove_relset(active_heap, inactive_heap,
+				ideal_list, r, relset_array,
+				min_ideal_weight);
+		memset(r, 0, sizeof(relation_set_t));
+	}
+}
+
+void load_next_relset_group_detach_deferred(merge_aux_t *aux,
+			heap_t *active_heap, heap_t *inactive_heap,
+			ideal_list_t *ideal_list,
+			relation_set_t *relset_array,
+			uint32 min_ideal_weight) {
+
+	uint32 i;
+
+	for (i = 0; i < aux->num_relsets; i++) {
+		uint32 relset_num = aux->tmp_relset_idx[i];
+		relation_set_t *r = relset_array + relset_num;
+		heap_remove_relset_deferred(active_heap, inactive_heap,
 				ideal_list, r, relset_array,
 				min_ideal_weight);
 		memset(r, 0, sizeof(relation_set_t));
