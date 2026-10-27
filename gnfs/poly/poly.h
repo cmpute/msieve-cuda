@@ -113,7 +113,7 @@ void get_poly_combined_score(poly_select_t *poly);
 
 void analyze_poly(poly_config_t *config, poly_select_t *poly);
 
-void save_poly(poly_config_t *config, poly_select_t *poly);
+uint32 save_poly(poly_config_t *config, poly_select_t *poly);
 
 #ifdef __cplusplus
 }

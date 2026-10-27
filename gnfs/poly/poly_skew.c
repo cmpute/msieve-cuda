@@ -68,7 +68,16 @@ rootopt_callback(void *extra, uint32 degree,
 		gmp_fprintf(data->all_poly_file, "Y%u: %Zd\n", i, coeff2[i]);
 	fflush(data->all_poly_file);
 
-	save_poly(config, &poly);            /* shared heap — inside the lock */
+	if (save_poly(config, &poly) && data->obj != NULL) {
+		/* stream the running best to the log so an external
+		   driver can stop the search the moment the quality
+		   bar is met (the .p file alone is inconvenient to
+		   tail, and the final log line only appears at exit) */
+		char adbuf[64];
+		gmp_snprintf(adbuf, sizeof(adbuf), "%Zd", coeff1[degree]);
+		logprintf(data->obj, "polyselect best E = %e "
+				"(ad = %s)\n", combined_score, adbuf);
+	}
 
 	if (data->file_lock)
 		mutex_unlock(data->file_lock);
@@ -189,6 +198,7 @@ build_stage2_workers(uint32 s, msieve_obj* obj, mpz_t n, uint32 degree,
 		k->rootopt_callback_data.all_poly_file = shared_poly_file; /* SHARED */
 		k->rootopt_callback_data.file_lock = file_lock;        /* SHARED */
 		k->rootopt_callback_data.stats = stats;
+		k->rootopt_callback_data.obj = obj;
 	}
 	return w;
 }
@@ -427,6 +437,7 @@ void find_poly_core(msieve_obj *obj, mpz_t n,
 
 		sprintf(buf, "%s.p", obj->savefile.name);
 		rootopt_callback_data.config = config;
+		rootopt_callback_data.obj = obj;
 		rootopt_callback_data.all_poly_file = fopen(buf, "a");
 		if (rootopt_callback_data.all_poly_file == NULL) {
 			printf("error: cannot open root opt file\n");

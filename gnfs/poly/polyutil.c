@@ -70,7 +70,7 @@ static void poly_select_free(poly_select_t *s) {
 }
 
 /*------------------------------------------------------------------*/
-void save_poly(poly_config_t *config, poly_select_t *poly) {
+uint32 save_poly(poly_config_t *config, poly_select_t *poly) {
 
 	/* save the polynomial if its combined score is the 
 	   best seen so far. A really thorough implementation
@@ -82,8 +82,11 @@ void save_poly(poly_config_t *config, poly_select_t *poly) {
 	   few such polynomials would then be subjected to 
 	   sieving experiments */
 
-	if (poly->combined_score > config->heap[0]->combined_score)
+	if (poly->combined_score > config->heap[0]->combined_score) {
 		poly_select_copy(config->heap[0], poly);
+		return 1;
+	}
+	return 0;
 }
 
 /*------------------------------------------------------------------*/

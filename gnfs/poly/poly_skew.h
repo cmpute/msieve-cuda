@@ -93,6 +93,7 @@ typedef struct {
 	poly_config_t* config;
 	poly_stage_stats_t* stats;
 	mutex_t* file_lock;   /* shared; serializes all_poly_file + save_poly */
+	msieve_obj* obj;      /* for streaming the running best E to the log */
 } rootopt_callback_data_t;
 
 typedef struct {
