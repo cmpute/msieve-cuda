@@ -621,7 +621,6 @@ uint32 heap_add_relset(heap_t *active_heap,
 
 /*--------------------------------------------------------------------*/
 uint64 merge_stat_recompute = 0;
-uint64 merge_stat_ideal_ops = 0;
 
 /*--------------------------------------------------------------------*/
 /* Deferred heap maintenance for batched merges.

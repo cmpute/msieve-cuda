@@ -81,6 +81,11 @@ There are three internal code paths based on data size relative to RAM:
 
 Extensions added for NFS@Home distributed factoring workflows, all controlled via the `-nc1`/`-nc2` argument string:
 
+**Batched full merge** (`common/filter/merge.c`, `common/filter/merge_util.c`):
+- `merge_batch=N` — pops N ideals off the active heap per round, takes the subset whose relation-set groups are pairwise disjoint, and runs each group's detach/merge/store on one thread (16 at most; the slots are memory-latency bound and more threads cost more than they save). The heaps are not touched inside a round: changed keys are recorded per ideal and `merge_defer_settle()` reconciles them once per round, which also coalesces the min-weight rescans the serial loop repeats per relation set. Without the flag the serial loop runs unchanged
+- The merge order (and so the matrix) differs from the serial loop's — keys are not refreshed within a round — but the bookkeeping is exact, and density/cycle-count come out the same (c137: 3.13-3.22M cycles at 90.1 weight/cycle either way). Runs are not byte-reproducible: slot completion order perturbs adjacency and heap tie-break order by a fraction of a percent of cycles. On the c137 reference the full merge drops from 57 s to ~31 s and `-nc1` RelProcTime from 343 s to ~300 s
+- Results are logged as `merge profile: ...` when the full merge finishes; the serial path logs its own segments under the same tag
+
 **Multi-density filtering** (`gnfs/filter/filter.c`):
 - `target_density=80,100,120` — comma-separated list; densities are sorted numerically, merged independently, each written to `msieve.dat.cyc.80` / `.cyc.100` / `.cyc.120`; stops at first failure
 - The post-singleton in-memory `relation_array` is deep-copied after the first merge and restored from memory (not re-read from disk) for each subsequent density

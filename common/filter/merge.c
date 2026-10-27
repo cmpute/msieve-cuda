@@ -583,7 +583,12 @@ int32 filter_merge_full(msieve_obj *obj, merge_t *merge, uint32 min_cycles) {
 	}
 #if defined(HAVE_OMP)
 	if (merge_batch > 0) {
+		/* the slots are memory-latency bound; past ~16 threads the
+		   wake and cacheline traffic costs more than the slots
+		   save (c137: 26 s at 4 threads, 21 s at 16, 68 s at 126) */
 		nthreads = omp_get_max_threads();
+		if (nthreads > 16)
+			nthreads = 16;
 		if (nthreads > merge_batch)
 			nthreads = merge_batch;
 	}
