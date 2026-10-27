@@ -84,8 +84,35 @@ typedef struct {
 	uint64 max_relations;   /* ordinals we are willing to store */
 	uint64 num_segments;
 	uint64 segment_alloc;
+	uint64 num_aliased;     /* leading segments that point into
+				   alias_block rather than owning mallocs */
 	abpair_t **segments;
+	void *alias_block;      /* backing store of the aliased segments */
 } dup_ab_cache_t;
+
+static void dup_ab_cache_init_alias(dup_ab_cache_t *c, abpair_t *block,
+			uint64 num_entries, uint64 max_relations) {
+
+	uint64 num_aliased = (num_entries + DUP_AB_SEGMENT_SIZE - 1) >>
+				DUP_AB_SEGMENT_LOG2;
+	uint64 i;
+
+	memset(c, 0, sizeof(*c));
+	if (max_relations < num_entries)
+		return;
+	c->max_relations = max_relations;
+	c->segment_alloc = (max_relations >> DUP_AB_SEGMENT_LOG2) + 2;
+	c->segments = (abpair_t **)calloc((size_t)c->segment_alloc,
+					sizeof(abpair_t *));
+	if (c->segments == NULL)
+		return;
+	for (i = 0; i < num_aliased; i++)
+		c->segments[i] = block + (size_t)i * DUP_AB_SEGMENT_SIZE;
+	c->num_segments = num_aliased;
+	c->num_aliased = num_aliased;
+	c->alias_block = block;
+	c->active = 1;
+}
 
 static void dup_ab_cache_init(dup_ab_cache_t *c, uint64 max_relations) {
 
@@ -106,10 +133,11 @@ static void dup_ab_cache_free(dup_ab_cache_t *c) {
 	uint64 i;
 
 	if (c->segments != NULL) {
-		for (i = 0; i < c->num_segments; i++)
+		for (i = c->num_aliased; i < c->num_segments; i++)
 			free(c->segments[i]);
 		free(c->segments);
 	}
+	free(c->alias_block);
 	memset(c, 0, sizeof(*c));
 }
 
@@ -466,6 +494,380 @@ static double estimate_rel_size(savefile_t *savefile) {
 #define BIN_SIZE (1 << (LOG2_BIN_SIZE))
 #define TARGET_HITS_PER_PRIME 40.0
 
+/* ------------------------------------------------------------------------
+   Persistent duplicate-removal state.
+
+   yagfu runs -nc1 repeatedly over one append-only savefile, and every
+   run re-hashes relations it has already hashed.  <savefile>.dup keeps
+   everything pass 1 learns about the dataset - the occupied and collided
+   bin bitmaps, the free-relation candidates (split into not-yet-added
+   and already-appended), the prime histogram behind the LP cutoff, the
+   (a,b) coordinates, and the bad-relation list - keyed to a byte
+   boundary of the savefile.  The next run loads it, seeks straight to
+   the boundary and only reads the relations appended since.
+
+   Append-only is the load-bearing assumption: it is what makes a byte
+   offset + ordinal count a valid description of the prefix.  The two
+   CRCs over the first and last 64 KiB of the prefix catch a replaced
+   or edited savefile cheaply; anything else falls back to a full pass.
+   ------------------------------------------------------------------------ */
+
+#if !defined(NO_ZLIB) && !defined(WIN32) && !defined(_WIN64)
+#define HAVE_DUP_CACHE 1
+#endif
+
+#ifdef HAVE_DUP_CACHE
+
+#define DUP_CACHE_MAGIC 0x31504459
+#define DUP_CACHE_VERSION 1
+#define DUP_CACHE_HDR_BYTES 128
+#define DUP_CACHE_CRC_BYTES ((uint64)64 * 1024)
+#define DUP_CACHE_FREE_BYTES ((uint64)(FREE_RELATION_LIMIT / 2 + 7) / 8)
+
+typedef struct {
+	uint32 magic;
+	uint32 version;
+	uint32 header_bytes;
+	uint32 log2_hashtable;
+	uint32 fb_bytes;
+	uint32 crc_head;
+	uint32 crc_tail;
+	uint32 abpair_bytes;
+	uint32 reserved;
+	uint64 dat_bytes;      /* savefile bytes covered by this cache */
+	uint64 num_scanned;    /* relation ordinals covered */
+	uint64 num_bins;       /* prime histogram bins */
+	uint64 br_bytes;       /* bad-relation list size */
+} dup_cache_header_t;
+
+typedef struct {
+	uint8 *occupied;       /* bins holding >= 1 relation ever */
+	uint8 *collided;       /* bins holding >= 2 relations ever */
+	uint8 *free_qual;      /* free-relation candidates not yet appended */
+	uint8 *free_added;     /* primes whose free relation is in the file */
+	uint64 *prime_bins;
+	abpair_t *ab_block;    /* num_scanned coordinates, segment aligned */
+	uint8 *br_blob;        /* bad-relation ordinals to prepend to .br */
+	uint64 br_bytes;
+	uint64 num_scanned;
+	uint64 dat_bytes;
+	uint32 log2_hashtable;
+} dup_resume_t;
+
+static char *dup_cache_read_name(const savefile_t *savefile) {
+	return (savefile->staged_name != NULL) ? savefile->staged_name :
+						savefile->name;
+}
+
+/* crc32 of len bytes at offset off; 0 on any error */
+
+static uint32 dup_cache_file_crc(const char *name, uint64 off, uint64 len) {
+
+	FILE *fp = fopen(name, "rb");
+	uint8 buf[65536];
+	uint32 crc = 0;
+
+	if (fp == NULL)
+		return 0;
+	if (fseeko(fp, (off_t)off, SEEK_SET) != 0) {
+		fclose(fp);
+		return 0;
+	}
+	while (len > 0) {
+		uint64 want = (len < sizeof(buf)) ? len : sizeof(buf);
+		size_t got = fread(buf, 1, (size_t)want, fp);
+		if (got == 0) {
+			fclose(fp);
+			return 0;
+		}
+		crc = (uint32)crc32(crc, buf, (uInt)got);
+		len -= got;
+	}
+	fclose(fp);
+	return crc;
+}
+
+static void dup_cache_invalidate(msieve_obj *obj, const char *reason) {
+
+	char cache_name[LINE_BUF_SIZE];
+
+	logprintf(obj, "note: duplicate-removal cache unusable (%s); "
+			"rebuilding it\n", reason);
+	snprintf(cache_name, sizeof(cache_name), "%s.dup",
+			obj->savefile.name);
+	remove(cache_name);
+}
+
+/* read a savefile region into a fresh buffer; NULL on any shortfall */
+
+static void *dup_cache_read_blob(FILE *fp, uint64 bytes) {
+
+	void *buf;
+
+	if (bytes == 0 || bytes > ((uint64)1 << 42))
+		return NULL;
+	buf = xmalloc((size_t)bytes);
+	if (fread(buf, 1, (size_t)bytes, fp) != bytes) {
+		free(buf);
+		return NULL;
+	}
+	return buf;
+}
+
+/* Validate and load <savefile>.dup.  Returns 1 with *res filled in and
+   *log2_out set; returns 0 after deleting an unusable cache. */
+
+static int dup_cache_try_load(msieve_obj *obj, savefile_t *savefile,
+			dup_resume_t *res, uint32 *log2_out) {
+
+	char *read_name = dup_cache_read_name(savefile);
+	char cache_name[LINE_BUF_SIZE];
+	const char *reason = NULL;
+	dup_cache_header_t hdr;
+	uint64 bitmap_bytes, num_bins, seg_entries;
+	uint64 cur_bytes, fb_bytes;
+	FILE *fp;
+
+	memset(res, 0, sizeof(*res));
+	snprintf(cache_name, sizeof(cache_name), "%s.dup", savefile->name);
+	fp = fopen(cache_name, "rb");
+	if (fp == NULL)
+		return 0;
+
+	if (fread(&hdr, 1, sizeof(hdr), fp) != sizeof(hdr) ||
+	    fseeko(fp, (off_t)hdr.header_bytes, SEEK_SET) != 0)
+		reason = "bad header";
+	else if (hdr.magic != DUP_CACHE_MAGIC ||
+		 hdr.version != DUP_CACHE_VERSION ||
+		 hdr.header_bytes < sizeof(hdr))
+		reason = "bad header";
+	else if (hdr.log2_hashtable < 25 || hdr.log2_hashtable > 42)
+		reason = "bad hashtable size";
+	else if (hdr.abpair_bytes != sizeof(abpair_t))
+		reason = "different word size";
+
+	if (reason == NULL) {
+		bitmap_bytes = (uint64)1 << (hdr.log2_hashtable - 3);
+		num_bins = (uint64)1 << (32 - LOG2_BIN_SIZE);
+		cur_bytes = get_file_size(read_name);
+		fb_bytes = get_file_size(obj->nfs_fbfile_name);
+		seg_entries = ((hdr.num_scanned + DUP_AB_SEGMENT_SIZE - 1) >>
+				DUP_AB_SEGMENT_LOG2) << DUP_AB_SEGMENT_LOG2;
+
+		if (hdr.num_scanned == 0)
+			reason = "empty cache";
+		else if (cur_bytes < hdr.dat_bytes ||
+			 hdr.dat_bytes < 2 * DUP_CACHE_CRC_BYTES)
+			reason = "savefile is missing the cached prefix";
+		else if (hdr.fb_bytes != fb_bytes)
+			reason = "factor base changed";
+	}
+	if (reason == NULL) {
+		FILE *cf = fopen(read_name, "rb");
+		char lastc = 0;
+
+		if (cf == NULL) {
+			reason = "cannot read savefile";
+		}
+		else if (fseeko(cf, (off_t)(hdr.dat_bytes - 1),
+					SEEK_SET) != 0 ||
+			 fread(&lastc, 1, 1, cf) != 1 ||
+			 lastc != '\n') {
+			reason = "boundary is not on a line end";
+			fclose(cf);
+		}
+		else if (dup_cache_file_crc(read_name, 0,
+				DUP_CACHE_CRC_BYTES) != hdr.crc_head ||
+			 dup_cache_file_crc(read_name,
+				hdr.dat_bytes - DUP_CACHE_CRC_BYTES,
+				DUP_CACHE_CRC_BYTES) != hdr.crc_tail) {
+			reason = "savefile prefix changed";
+			fclose(cf);
+		}
+		else
+			fclose(cf);
+	}
+
+	if (reason == NULL) {
+		res->occupied = (uint8 *)dup_cache_read_blob(fp, bitmap_bytes);
+		res->collided = (uint8 *)dup_cache_read_blob(fp, bitmap_bytes);
+		res->free_qual = (uint8 *)dup_cache_read_blob(fp,
+				DUP_CACHE_FREE_BYTES);
+		res->free_added = (uint8 *)dup_cache_read_blob(fp,
+				DUP_CACHE_FREE_BYTES);
+		res->prime_bins = (uint64 *)dup_cache_read_blob(fp,
+				num_bins * sizeof(uint64));
+		/* the save writes exactly num_scanned coordinates; the
+		   backing block is segment-rounded so the aliasing below
+		   can hand whole segments to the cache */
+		res->ab_block = (abpair_t *)malloc(
+				(size_t)(seg_entries * sizeof(abpair_t)));
+		if (res->ab_block != NULL &&
+		    fread(res->ab_block, sizeof(abpair_t),
+				(size_t)hdr.num_scanned, fp) !=
+				hdr.num_scanned) {
+			free(res->ab_block);
+			res->ab_block = NULL;
+		}
+		res->br_blob = (hdr.br_bytes > 0) ?
+				(uint8 *)dup_cache_read_blob(fp,
+					hdr.br_bytes) : NULL;
+		if (res->occupied == NULL || res->collided == NULL ||
+		    res->free_qual == NULL || res->free_added == NULL ||
+		    res->prime_bins == NULL || res->ab_block == NULL ||
+		    (hdr.br_bytes > 0 && res->br_blob == NULL))
+			reason = "cache is truncated or out of memory";
+	}
+	fclose(fp);
+
+	if (reason != NULL) {
+		free(res->occupied); free(res->collided);
+		free(res->free_qual); free(res->free_added);
+		free(res->prime_bins); free(res->ab_block);
+		free(res->br_blob);
+		memset(res, 0, sizeof(*res));
+		dup_cache_invalidate(obj, reason);
+		return 0;
+	}
+
+	res->log2_hashtable = hdr.log2_hashtable;
+	res->num_scanned = hdr.num_scanned;
+	res->dat_bytes = hdr.dat_bytes;
+	res->br_bytes = hdr.br_bytes;
+	*log2_out = hdr.log2_hashtable;
+	logprintf(obj, "reusing duplicate-removal cache: %" PRIu64
+			" relations, %" PRIu64 " bytes of savefile\n",
+			hdr.num_scanned, hdr.dat_bytes);
+	return 1;
+}
+
+/* Rewrite <savefile>.dup to cover the savefile up to its current size.
+   num_scanned is the ordinal count pass 2 walked (relations + the free
+   relations appended this run); the ab cache must be active and must
+   cover all of them, otherwise the old file is left in place, still
+   valid for the prefix it does cover. */
+
+static void dup_cache_save(msieve_obj *obj, savefile_t *savefile,
+			factor_base_t *fb, uint32 log2_hashtable,
+			uint8 *occupied, uint8 *collided,
+			uint8 *free_qual, uint8 *free_added,
+			uint64 *prime_bins, const dup_ab_cache_t *ab_cache,
+			uint64 num_scanned, const char *br_name) {
+
+	char *read_name = dup_cache_read_name(savefile);
+	char cache_name[LINE_BUF_SIZE], tmp_name[LINE_BUF_SIZE];
+	uint8 pad[DUP_CACHE_HDR_BYTES];
+	dup_cache_header_t hdr;
+	uint64 dat_bytes, bitmap_bytes, num_bins;
+	uint64 full_segments, last_segment_entries, i;
+	uint64 br_bytes = 0;
+	void *br_blob = NULL;
+	FILE *fp;
+	int ok;
+
+	if (!ab_cache->active ||
+	    ab_cache->max_relations < num_scanned ||
+	    num_scanned < ab_cache->num_aliased * DUP_AB_SEGMENT_SIZE)
+		return;
+
+	dat_bytes = get_file_size(read_name);
+	if (dat_bytes < 2 * DUP_CACHE_CRC_BYTES)
+		return;
+
+	memset(&hdr, 0, sizeof(hdr));
+	hdr.magic = DUP_CACHE_MAGIC;
+	hdr.version = DUP_CACHE_VERSION;
+	hdr.header_bytes = DUP_CACHE_HDR_BYTES;
+	hdr.log2_hashtable = log2_hashtable;
+	hdr.fb_bytes = (uint32)get_file_size(obj->nfs_fbfile_name);
+	hdr.crc_head = dup_cache_file_crc(read_name, 0,
+				DUP_CACHE_CRC_BYTES);
+	hdr.crc_tail = dup_cache_file_crc(read_name,
+				dat_bytes - DUP_CACHE_CRC_BYTES,
+				DUP_CACHE_CRC_BYTES);
+	hdr.abpair_bytes = sizeof(abpair_t);
+	hdr.dat_bytes = dat_bytes;
+	hdr.num_scanned = num_scanned;
+	hdr.num_bins = (uint64)1 << (32 - LOG2_BIN_SIZE);
+
+	fp = fopen(br_name, "rb");
+	if (fp != NULL) {
+		fseeko(fp, 0, SEEK_END);
+		br_bytes = (uint64)ftello(fp);
+		fseeko(fp, 0, SEEK_SET);
+		br_blob = dup_cache_read_blob(fp, br_bytes);
+		fclose(fp);
+		if (br_blob == NULL)
+			br_bytes = 0;
+	}
+	hdr.br_bytes = br_bytes;
+
+	bitmap_bytes = (uint64)1 << (log2_hashtable - 3);
+	num_bins = (uint64)1 << (32 - LOG2_BIN_SIZE);
+	full_segments = num_scanned >> DUP_AB_SEGMENT_LOG2;
+	last_segment_entries = num_scanned & (DUP_AB_SEGMENT_SIZE - 1);
+
+	snprintf(tmp_name, sizeof(tmp_name), "%s.dup.tmp",
+			savefile->name);
+	fp = fopen(tmp_name, "wb");
+	if (fp == NULL) {
+		free(br_blob);
+		return;
+	}
+
+	memset(pad, 0, sizeof(pad));
+	ok = (fwrite(&hdr, 1, sizeof(hdr), fp) == sizeof(hdr)) &&
+	     (fwrite(pad, 1, DUP_CACHE_HDR_BYTES - sizeof(hdr), fp) ==
+				DUP_CACHE_HDR_BYTES - sizeof(hdr)) &&
+	     (fwrite(occupied, 1, bitmap_bytes, fp) == bitmap_bytes) &&
+	     (fwrite(collided, 1, bitmap_bytes, fp) == bitmap_bytes) &&
+	     (fwrite(free_qual, 1, DUP_CACHE_FREE_BYTES, fp) ==
+				DUP_CACHE_FREE_BYTES) &&
+	     (fwrite(free_added, 1, DUP_CACHE_FREE_BYTES, fp) ==
+				DUP_CACHE_FREE_BYTES) &&
+	     (fwrite(prime_bins, sizeof(uint64), (size_t)num_bins, fp) ==
+				num_bins);
+
+	for (i = 0; ok && i < full_segments; i++) {
+		ok = fwrite(ab_cache->segments[i], sizeof(abpair_t),
+				(size_t)DUP_AB_SEGMENT_SIZE, fp) ==
+				DUP_AB_SEGMENT_SIZE;
+	}
+	if (ok && last_segment_entries > 0)
+		ok = fwrite(ab_cache->segments[full_segments],
+				sizeof(abpair_t),
+				(size_t)last_segment_entries, fp) ==
+				last_segment_entries;
+	if (ok && br_bytes > 0)
+		ok = fwrite(br_blob, 1, (size_t)br_bytes, fp) == br_bytes;
+	if (fclose(fp) != 0)
+		ok = 0;
+	free(br_blob);
+
+	snprintf(cache_name, sizeof(cache_name), "%s.dup",
+			savefile->name);
+	if (!ok) {
+		logprintf(obj, "warning: could not write the "
+				"duplicate-removal cache\n");
+		remove(tmp_name);
+		return;
+	}
+	remove(cache_name);
+	if (rename(tmp_name, cache_name) != 0) {
+		logprintf(obj, "warning: could not install the "
+				"duplicate-removal cache\n");
+		return;
+	}
+	logprintf(obj, "wrote duplicate-removal cache: %" PRIu64
+			" relations, %.1f MB\n",
+			num_scanned,
+			(double)(DUP_CACHE_HDR_BYTES + 2 * bitmap_bytes +
+			 2 * DUP_CACHE_FREE_BYTES + num_bins * 8 +
+			 num_scanned * sizeof(abpair_t) + br_bytes) /
+			1048576.0);
+}
+#endif  /* HAVE_DUP_CACHE */
+
 /* Reading the savefile is one gzgets per line and cannot be split across
    threads, but it does not have to sit between the parallel passes: it
    only has to stay ahead of them. Holding the sequential reader state
@@ -542,6 +944,12 @@ uint32 nfs_purge_duplicates(msieve_obj *obj, factor_base_t *fb,
 	double rel_size = estimate_rel_size(savefile);
 	double est_num_rels = 0.0;
 	dup_ab_cache_t ab_cache;
+	int32 resumed = 0;
+	uint32 use_dup_cache = 0;
+#if defined(HAVE_DUP_CACHE)
+	dup_resume_t dup_res;
+#endif
+
 	uint8 *collision_bits = NULL;
 	uint64 cache_bytes = 0;
 	uint64 num_free_added = 0;
@@ -598,13 +1006,67 @@ uint32 nfs_purge_duplicates(msieve_obj *obj, factor_base_t *fb,
 
 	logprintf(obj, "commencing duplicate removal, pass 1\n");
 
+#if defined(HAVE_DUP_CACHE)
+	{
+		const char *arg;
+		if (obj->nfs_args != NULL &&
+		    (arg = strstr(obj->nfs_args, "dup_cache=")) != NULL &&
+		    strtoul(arg + 10, NULL, 10) != 0) {
+			if (max_relations != 0) {
+				logprintf(obj, "note: dup_cache ignored "
+						"with filter_maxrels\n");
+			}
+			else if (savefile->isCompressed) {
+				logprintf(obj, "note: dup_cache needs an "
+						"uncompressed savefile\n");
+			}
+			else {
+				uint32 cached_log2 = 0;
+				resumed = dup_cache_try_load(obj, savefile,
+						&dup_res, &cached_log2);
+				if (resumed)
+					log2_hashtable1_size = cached_log2;
+				use_dup_cache = 1;
+			}
+		}
+		if (use_dup_cache && dup_res.free_added == NULL) {
+			/* tracking which free relations are already in the
+			   savefile starts empty on a cache-building run */
+			dup_res.free_added = (uint8 *)xcalloc(
+					(size_t)DUP_CACHE_FREE_BYTES,
+					(size_t)1);
+		}
+	}
+#endif
+
 	savefile_open(savefile, SAVEFILE_READ);
+#if defined(HAVE_DUP_CACHE)
+	if (resumed) {
+		/* pick up where the cache left off: the reader jumps to
+		   the cached byte boundary and the ordinals continue
+		   from the cached count */
+		gzseek((gzFile)savefile->fp, (z_off_t)dup_res.dat_bytes,
+				SEEK_SET);
+	}
+#endif
 	get_filter_tmp_name(obj, buf, LINE_BUF_SIZE, ".br");
 	bad_relation_fp = fopen(buf, "wb");
 	if (bad_relation_fp == NULL) {
 		logprintf(obj, "error: dup1 can't open relation file\n");
 		exit(-1);
 	}
+#if defined(HAVE_DUP_CACHE)
+	if (resumed) {
+		/* the cached bad-relation ordinals come first; pass 1
+		   appends this run's own below them */
+		if (fwrite(dup_res.br_blob, 1, (size_t)dup_res.br_bytes,
+					bad_relation_fp) != dup_res.br_bytes) {
+			logprintf(obj, "error: dup1 can't stage the cached "
+					"bad-relation list\n");
+			exit(-1);
+		}
+	}
+#endif
 	get_filter_tmp_name(obj, buf, LINE_BUF_SIZE, ".hc");
 	collision_fp = fopen(buf, "wb");
 	if (collision_fp == NULL) {
@@ -618,20 +1080,28 @@ uint32 nfs_purge_duplicates(msieve_obj *obj, factor_base_t *fb,
 	   actually count the relations. So we estimate the average
 	   relation size and then the number of relations */
 
-	log2_hashtable1_size = 28;
-	if (rel_size > 0.0) {
+	if (rel_size > 0.0)
 		est_num_rels = get_file_size(savefile->name) / rel_size;
-		log2_hashtable1_size = log(est_num_rels * 10.0) / M_LN2 + 0.5;
+	if (!resumed) {
+		log2_hashtable1_size = 28;
+		if (est_num_rels > 0.0) {
+			log2_hashtable1_size = log(est_num_rels * 10.0) /
+					M_LN2 + 0.5;
+		}
+		if (log2_hashtable1_size < 25)
+			log2_hashtable1_size = 25;
+		if (log2_hashtable1_size > 63)
+		 	log2_hashtable1_size = 63;
+		/* printf("log2_hashtable1_size = %u\n",
+				log2_hashtable1_size); */
 	}
-	if (log2_hashtable1_size < 25)
-		log2_hashtable1_size = 25;
-	if (log2_hashtable1_size > 63)
-	 	log2_hashtable1_size = 63;
-	/* printf("log2_hashtable1_size = %u\n", log2_hashtable1_size); */
-	hashtable = (uint8 *)xcalloc((uint64)1 <<
-				(log2_hashtable1_size - 3), sizeof(uint8));
+
+	hashtable = (resumed != 0) ? dup_res.occupied : (uint8 *)xcalloc(
+			(uint64)1 << (log2_hashtable1_size - 3),
+			sizeof(uint8));
 	num_bins = (uint32)1 << (32 - LOG2_BIN_SIZE);
-	prime_bins = (uint64 *)xcalloc((size_t)num_bins, sizeof(uint64));
+	prime_bins = (resumed != 0) ? dup_res.prime_bins : (uint64 *)xcalloc(
+			(size_t)num_bins, sizeof(uint64));
 
 	/* Walking each relation's factors to build the prime histogram is
 	   the largest part of this pass's serial work -- about 1.9 billion
@@ -661,6 +1131,33 @@ uint32 nfs_purge_duplicates(msieve_obj *obj, factor_base_t *fb,
 	   pass 2's own bit table and collision hashtable. */
 
 	memset(&ab_cache, 0, sizeof(ab_cache));
+#if defined(HAVE_DUP_CACHE)
+	if (resumed) {
+		/* the loaded coordinates back the leading segments; the
+		   cache grows past them with ordinary mallocs.  The
+		   memory is already spent, so the budget check below
+		   does not apply */
+
+		uint64 cache_limit = (uint64)(est_num_rels * 1.5) + 1024;
+		if (cache_limit < dup_res.num_scanned + 1024)
+			cache_limit = dup_res.num_scanned + 1024;
+
+		dup_ab_cache_init_alias(&ab_cache, dup_res.ab_block,
+				dup_res.num_scanned, cache_limit);
+		collision_bits = dup_res.collided;
+		if (!ab_cache.active) {
+			/* out of segments pointers: fall back to a full,
+			   uncached pass rather than a broken resume */
+			resumed = 0;
+			free(dup_res.free_qual);
+			free(dup_res.free_added);
+			free(dup_res.br_blob);
+			logprintf(obj, "note: dup cache resume abandoned "
+					"(cannot extend coordinates)\n");
+		}
+	}
+	else
+#endif
 	if (est_num_rels > 0.0 && ram_size > 0) {
 		/* tolerate a 50% underestimate of the relation count; the
 		   budget below is checked against this cap, so the memory
@@ -684,7 +1181,8 @@ uint32 nfs_purge_duplicates(msieve_obj *obj, factor_base_t *fb,
 
 	/* set up the structures for tracking free relations */
 
-	free_relation_bits = (uint8 *)xcalloc(
+	free_relation_bits = (resumed != 0) ? dup_res.free_qual :
+			(uint8 *)xcalloc(
 				((size_t)(FREE_RELATION_LIMIT/2) + 7) / 8,
 				(size_t)1);
 	num_free_relations = 0;
@@ -701,7 +1199,15 @@ uint32 nfs_purge_duplicates(msieve_obj *obj, factor_base_t *fb,
 	rd.savefile = savefile;
 	rd.max_relations = max_relations;
 	rd.batch = batch;
+#if defined(HAVE_DUP_CACHE)
+	/* the reader derives ordinals as curr_relation + i + 1, so the
+	   cached count minus one makes the first new relation pick up
+	   at the cached ordinal count */
+	rd.curr_relation = (resumed != 0) ? dup_res.num_scanned - 1 :
+				curr_relation;
+#else
 	rd.curr_relation = curr_relation;
+#endif
 	rd.done = 0;
 
 	/* prime the pipeline with the first batch */
@@ -880,7 +1386,8 @@ uint32 nfs_purge_duplicates(msieve_obj *obj, factor_base_t *fb,
 	}
 	free(thread_bins);
 
-	free(hashtable);
+	if (!use_dup_cache)
+		free(hashtable);   /* the cache path needs it for the save */
 	savefile_close(savefile);
 	dup_close_output(obj, bad_relation_fp, "bad relation list");
 	dup_close_output(obj, collision_fp, "collision list");
@@ -906,6 +1413,19 @@ uint32 nfs_purge_duplicates(msieve_obj *obj, factor_base_t *fb,
 		   already present in the dataset, then add
 		   free relations that remain */
 
+#if defined(HAVE_DUP_CACHE)
+		if (resumed) {
+			/* the tail re-reports primes whose free relation
+			   an earlier run already appended; the scanned
+			   prefix that used to cancel them is skipped, so
+			   drop them by name */
+			uint64 fb_i;
+
+			for (fb_i = 0; fb_i < DUP_CACHE_FREE_BYTES; fb_i++)
+				free_relation_bits[fb_i] &=
+					~dup_res.free_added[fb_i];
+		}
+#endif
 		for (i = 0; i < num_free_relations; i++) {
 			uint32 p = free_relations[i];
 
@@ -925,8 +1445,11 @@ uint32 nfs_purge_duplicates(msieve_obj *obj, factor_base_t *fb,
 
 			nfree = add_free_relations(obj, fb, free_relation_bits,
 					(ab_cache.active ||
-					 savefile->staged_name != NULL) ?
-						&free_primes : NULL);
+					 savefile->staged_name != NULL
+#if defined(HAVE_DUP_CACHE)
+					 || use_dup_cache
+#endif
+					 ) ? &free_primes : NULL);
 			num_relations += nfree;
 
 			if (free_primes != NULL) {
@@ -936,6 +1459,38 @@ uint32 nfs_purge_duplicates(msieve_obj *obj, factor_base_t *fb,
 						curr_relation + 1 + k,
 						(int64)free_primes[k], 0);
 				}
+#if defined(HAVE_DUP_CACHE)
+				if (use_dup_cache) {
+					for (k = 0; k < nfree; k++) {
+						uint32 p = free_primes[k] / 2;
+						uint64 blob[2];
+						uint64 hv;
+
+						free_relation_bits[p / 8] &=
+							~hashmask[p % 8];
+						dup_res.free_added[p / 8] |=
+							hashmask[p % 8];
+
+						/* the appended lines were
+						   never hashed by the scan
+						   (they exist only after it);
+						   their bins must be in the
+						   persisted occupied set or
+						   the next run misses every
+						   duplicate against them */
+						blob[0] = free_primes[k];
+						blob[1] = 0;
+						hv = (rrxmrrxmsx_0(blob[0]) ^
+						      rrxmrrxmsx_0(blob[1])) >>
+							(64 - log2_hashtable1_size);
+						hashtable[hv / 8] |=
+							hashmask[hv % 8];
+						if (collision_bits != NULL)
+							collision_bits[hv / 8] |=
+								hashmask[hv % 8];
+					}
+				}
+#endif
 			}
 
 			/* add_free_relations() appended to the original
@@ -965,7 +1520,8 @@ uint32 nfs_purge_duplicates(msieve_obj *obj, factor_base_t *fb,
 		}
 	}
 	free(free_relations);
-	free(free_relation_bits);
+	if (!use_dup_cache)
+		free(free_relation_bits);
 
 	/* free per thread variables */
 
@@ -982,9 +1538,12 @@ uint32 nfs_purge_duplicates(msieve_obj *obj, factor_base_t *fb,
 	free(tmp_rel);
 	free(status);
 
-	if (num_collisions == 0) {
+	if (num_collisions == 0 && !resumed) {
 
-		/* no duplicates; no second pass is necessary */
+		/* no duplicates; no second pass is necessary.  A resumed
+		   run always replays pass 2: the .d file has to describe
+		   every relation set in the savefile, and the old
+		   duplicates are still in it */
 
 		char buf2[256];
 		get_filter_tmp_name(obj, buf, LINE_BUF_SIZE, ".hc");
@@ -1004,8 +1563,54 @@ uint32 nfs_purge_duplicates(msieve_obj *obj, factor_base_t *fb,
 					curr_relation + 1 + num_free_added);
 	}
 
+#if defined(HAVE_DUP_CACHE)
+	if (use_dup_cache) {
+		char br_name[LINE_BUF_SIZE];
+
+		/* the persisted 'occupied' set is every bin that has ever
+		   held a relation.  Reporting a collision clears the bin
+		   in the working table, so fold this run's reports back
+		   in before writing */
+
+		if (collision_bits != NULL) {
+			uint64 hb_i;
+			uint64 hb_bytes = (uint64)1 <<
+					(log2_hashtable1_size - 3);
+
+			for (hb_i = 0; hb_i < hb_bytes; hb_i++)
+				hashtable[hb_i] |= collision_bits[hb_i];
+		}
+		if (ab_cache.active) {
+			get_filter_tmp_name(obj, br_name, LINE_BUF_SIZE,
+					".br");
+			dup_cache_save(obj, savefile, fb,
+					log2_hashtable1_size,
+					hashtable, collision_bits,
+					free_relation_bits,
+					dup_res.free_added,
+					prime_bins, &ab_cache,
+					curr_relation + 1 + num_free_added,
+					br_name);
+		}
+		else {
+			/* the coordinate cache was dropped mid-run; leave
+			   the previous file in place, still valid for the
+			   shorter prefix it covers */
+			logprintf(obj, "note: not writing a duplicate-"
+					"removal cache; the coordinates did "
+					"not survive the pass\n");
+		}
+	}
+#endif
+
 	dup_ab_cache_free(&ab_cache);
+	if (use_dup_cache)
+		free(hashtable);   /* freed above on the plain path */
 	free(collision_bits);
+#if defined(HAVE_DUP_CACHE)
+	if (use_dup_cache)
+#endif
+		free(free_relation_bits);
 	free(buf);
 
 	/* the large prime cutoff for the rest of the filtering
