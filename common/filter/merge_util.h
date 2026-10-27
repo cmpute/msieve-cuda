@@ -150,6 +150,26 @@ void load_next_relset_group(merge_aux_t *aux,
 			relation_set_t *relset_array,
 			uint32 ideal, uint32 min_ideal_weight);
 
+/* The two halves of load_next_relset_group, split so that a
+   batch of groups can be snapshotted before any of them is
+   detached. The copy half only reads shared state, so it is
+   safe for many groups at once as long as no two of the
+   groups share a relation set. The detach half mutates the
+   heaps, the ideal adjacency lists and the group's relation
+   set slots, and must run serially in the order the groups
+   were loaded */
+
+void load_next_relset_group_copy(merge_aux_t *aux,
+			ideal_list_t *ideal_list,
+			relation_set_t *relset_array,
+			uint32 ideal);
+
+void load_next_relset_group_detach(merge_aux_t *aux,
+			heap_t *active_heap, heap_t *inactive_heap,
+			ideal_list_t *ideal_list,
+			relation_set_t *relset_array,
+			uint32 min_ideal_weight);
+
 /* find all the relation sets that contain a given ideal,
    and remove the ideal from those relation sets. Each
    relation set has its count of small ideals incremented;

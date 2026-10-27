@@ -86,19 +86,23 @@ void merge_mem_pool_destroy(merge_mem_pool_t *pool) {
 
 uint32 *merge_mem_alloc(merge_mem_pool_t *pool, uint32 words) {
 	uint32 idx, class_words;
-	void *p;
+	void *p = NULL;
 	if (words == 0)
 		return NULL;
 	if (pool == NULL || words > MERGE_POOL_MAX_WORDS)
 		return (uint32 *)xmalloc((size_t)words * sizeof(uint32));
 	idx = merge_pool_class(words, &class_words);
+#if defined(HAVE_OMP)
+	/* parallel merges share one pool; the free lists and the
+	   block bump pointers are the only shared mutable state */
+#pragma omp critical(mergepool)
+#endif
+	{
 	if (pool->free_list[idx] != NULL) {
 		p = pool->free_list[idx];
 		pool->free_list[idx] = *(void **)p;
-		return (uint32 *)p;
 	}
-
-	{
+	else {
 		size_t block_bytes = (size_t)class_words * sizeof(uint32);
 		if (pool->blocks_left[idx] == 0) {
 			size_t slab_bytes = MERGE_POOL_SLAB_BYTES;
@@ -121,6 +125,7 @@ uint32 *merge_mem_alloc(merge_mem_pool_t *pool, uint32 words) {
 		pool->next_block[idx] += block_bytes;
 		pool->blocks_left[idx]--;
 	}
+	}
 	return (uint32 *)p;
 }
 
@@ -134,6 +139,9 @@ void merge_mem_free(merge_mem_pool_t *pool, uint32 *ptr, uint32 words) {
 	}
 	idx = merge_pool_class(words, &class_words);
 	(void)class_words;
+#if defined(HAVE_OMP)
+#pragma omp critical(mergepool)
+#endif
 	merge_mem_free_class(pool, ptr, idx);
 }
 
@@ -731,12 +739,10 @@ uint32 heap_remove_worst(heap_t *heap, ideal_list_t *ideal_list) {
 }
 
 /*--------------------------------------------------------------------*/
-void load_next_relset_group(merge_aux_t *aux,
-			heap_t *active_heap, heap_t *inactive_heap,
+void load_next_relset_group_copy(merge_aux_t *aux,
 			ideal_list_t *ideal_list,
 			relation_set_t *relset_array,
-			uint32 ideal,
-			uint32 min_ideal_weight) {
+			uint32 ideal) {
 
 	uint32 i;
 	ideal_set_t *ideal_set = ideal_list->list + ideal;
@@ -757,6 +763,15 @@ void load_next_relset_group(merge_aux_t *aux,
 		aux->tmp_relset_idx[i] = relset_num;
 		aux->tmp_relsets[i] = relset_array[relset_num];
 	}
+}
+
+void load_next_relset_group_detach(merge_aux_t *aux,
+			heap_t *active_heap, heap_t *inactive_heap,
+			ideal_list_t *ideal_list,
+			relation_set_t *relset_array,
+			uint32 min_ideal_weight) {
+
+	uint32 i;
 
 	/* now that all the relation sets are safely copied,
 	   go back and remove the originals from the heap,
@@ -771,6 +786,20 @@ void load_next_relset_group(merge_aux_t *aux,
 				min_ideal_weight);
 		memset(r, 0, sizeof(relation_set_t));
 	}
+}
+
+void load_next_relset_group(merge_aux_t *aux,
+			heap_t *active_heap, heap_t *inactive_heap,
+			ideal_list_t *ideal_list,
+			relation_set_t *relset_array,
+			uint32 ideal,
+			uint32 min_ideal_weight) {
+
+	load_next_relset_group_copy(aux, ideal_list,
+				relset_array, ideal);
+	load_next_relset_group_detach(aux, active_heap, inactive_heap,
+				ideal_list, relset_array,
+				min_ideal_weight);
 }
 
 /*--------------------------------------------------------------------*/
