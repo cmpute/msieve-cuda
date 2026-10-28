@@ -648,7 +648,24 @@ void mp_rshift(mp_t *a, uint32 shift, mp_t *res) {
 		t.val[i] = 0;
 
 	t.nwords = num_nonzero_words(t.val, (uint32)(words - start_word));
-	*res = t;
+
+	/* the only caller shifts in place (res == a) and reserves only the
+	   words its own writes can reach - gcc sizes the caller's stack
+	   slot accordingly, so the full-struct copy this function used to
+	   end with overruns the slot by the unused tail whenever the value
+	   is short (observed as a stack-smashing abort in
+	   form_post_lanczos_matrix on matrices whose dense bitfield is
+	   under MAX_MP_WORDS words).  Copy back exactly the words the
+	   shift produced; anything above res->nwords is unreadable by the
+	   mp_t convention anyway */
+
+	{
+		uint32 back = (uint32)(words - start_word);
+
+		for (i = 0; i < (int32)back; i++)
+			res->val[i] = t.val[i];
+		res->nwords = t.nwords;
+	}
 }
 
 /*---------------------------------------------------------------*/
