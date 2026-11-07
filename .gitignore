@@ -7,9 +7,12 @@ common/lanczos/gpu/BxN_NxB_cpu.c
 *.no
 *.o
 msieve
+msieve_bin2c
+msieve_bin2c.exe
 *.a
 *.fatbin
 *.ptx
+*_embed.c
 *.qo
 *.so
 built
